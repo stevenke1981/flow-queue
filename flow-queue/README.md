@@ -38,6 +38,33 @@ Google Flow 的提示詞排隊工具（Chrome 擴充功能，Manifest V3）。
 - **自動下載（選用）**：完成後下載到 Chrome 下載目錄底下的資料夾（預設 `FlowQueue/`）。
 - **重新整理後接手**：Flow 頁面重新整理後，仍在生成中的項目會重新接手追蹤。
 
+## 參考圖、角色與素材（v1.1）
+
+在「素材」區可以替這一批提示詞附加：
+
+- **角色**：輸入 Flow 專案裡的角色名稱（Characters）。
+- **素材**：輸入 Flow 素材庫的標題，可選擇類別（圖片、上傳、影片）。
+- **參考圖**：選擇本機圖片（每張最多 10 MB）。第一次使用時會自動上傳到目前的 Flow 專案，之後重複使用。
+- **從 Flow 載入清單**：從 Flow 讀取現有的角色或素材名稱，點選即可加入。
+
+執行到這一筆時，佇列會依序操作 Flow：
+
+1. 先清空提示詞框上的既有素材（可在設定中關閉）。
+2. 依序加入每個素材，並確認提示詞框上真的出現了素材 chip。
+3. 填入提示詞並開始生成。
+
+找不到素材時，這一筆會標記為失敗並寫明缺少哪一個，不會重試，也不會扣點數。
+
+## 讓 AI 代理操作（Claude Code / Codex / agy）
+
+`flow-queue-bridge/` 是一個本機橋接程式（MCP 伺服器加上 `flowq` 指令），可以讓 Claude Code、OpenAI Codex CLI、Google Antigravity（agy）新增提示詞、附加參考圖、開始或停止佇列，並等待結果。安裝與配對步驟見 `flow-queue-bridge/README.md`。
+
+安全設計：
+
+- 橋接只聽 `127.0.0.1`，預設關閉。
+- 必須在側邊面板貼上配對碼，擴充功能與橋接程式會互相驗證身分。
+- 網頁無法呼叫這個橋接。
+
 ## 注意事項
 
 - **真實點擊**：
@@ -57,3 +84,6 @@ Google Flow 的提示詞排隊工具（Chrome 擴充功能，Manifest V3）。
 | `background.js` | 佇列狀態的唯一寫入者，也負責真實點擊（debugger）與下載 |
 | `content.js` | 在 Flow 分頁內執行的排隊器（填入、送出、追蹤完成） |
 | `sidepanel.*` | 側邊面板介面 |
+| `bridge-client.js` | 擴充功能端的本機橋接連線（WebSocket，雙向驗證） |
+| `../flow-queue-bridge/` | 給 AI 代理用的 MCP 伺服器、daemon 與 `flowq` CLI |
+| `../docs/DESIGN.md` | 訊息與橋接協定合約 |

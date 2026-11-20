@@ -279,6 +279,368 @@
     return norm((t && t.textContent) || tile.innerText).slice(0, 200) || 'Flow 生成失敗';
   }
 
+
+  // ---------------- ingredients（參考圖 / 角色 / 素材） ----------------
+  const overlayRoot = () => document.querySelector('.cdk-overlay-container');
+  const picker = () => (overlayRoot() || document).querySelector('flow-add-menu-popover-content, .mobile-add-menu-container');
+  const projectId = () => { const m = location.pathname.match(/\/project\/([A-Za-z0-9_-]+)/); return m ? m[1] : ''; };
+
+  function addIngredientButton() {
+    const box = promptBox();
+    return [...box.querySelectorAll('button[aria-label="Add ingredients to the prompt box"], flow-add-menu button.add-menu-trigger')].find(visible) || null;
+  }
+  const chips = () => [...promptBox().querySelectorAll('flow-ingredient-bar flow-ingredient-chip, flow-ingredient-bar flow-image-ingredient-chip, flow-ingredient-bar button.chip-container')]
+    .map((c) => c.closest('flow-ingredient-chip, flow-image-ingredient-chip') || c)
+    .filter((c, i, a) => a.indexOf(c) === i);
+  const chipsBusy = () => [...promptBox().querySelectorAll('flow-ingredient-bar button.chip-container')]
+    .some((c) => c.getAttribute('aria-busy') === 'true' || c.querySelector('mat-progress-spinner, mat-spinner'));
+  const iconText = (el) => norm([...el.querySelectorAll('mat-icon, i, .material-symbols-outlined, .google-symbols')].map((i) => i.textContent).join(' '));
+
+  async function openPicker() {
+    const open = picker();
+    if (open) return open;
+    await closeOverlays();
+    const btn = addIngredientButton();
+    if (!btn) throw new Error('找不到 Flow 的「新增素材」按鈕（目前模式可能不支援素材）');
+    btn.click();
+    const p = await waitFor(picker, 5000, 150);
+    if (!p) throw new Error('Flow 素材選擇器沒有打開');
+    await sleep(400);
+    return p;
+  }
+
+  const CATEGORY_WORDS = {
+    All: ['all', '全部', '所有'],
+    Images: ['images', 'image', '圖片', '图片', '圖像'],
+    Characters: ['characters', 'character', '角色', '人物'],
+    Videos: ['videos', 'video', '影片', '视频', '視訊'],
+    Uploads: ['uploads', 'upload', '上傳', '上传', '已上傳']
+  };
+  const isCategory = (el, cat) => {
+    const t = norm(el.textContent);
+    return (CATEGORY_WORDS[cat] || [norm(cat)]).some((w) => t === w || t.startsWith(w + ' ') || t.startsWith(w + '('));
+  };
+
+  const assetRows = (p = picker()) => [...(p ? p.querySelectorAll('button.asset-item') : [])].map((btn) => {
+    const img = btn.querySelector('img');
+    const titleEl = btn.querySelector('.asset-title');
+    return {
+      btn,
+      title: String((titleEl && titleEl.textContent) || btn.getAttribute('title') || btn.getAttribute('aria-label') || '').trim(),
+      type: String((btn.querySelector('.type-subtitle') || {}).textContent || '').trim(),
+      src: (img && img.src) || ''
+    };
+  });
+
+  async function waitListChange(p, before, ms = 3000) {
+    await waitFor(() => {
+      const now = [...p.querySelectorAll('button.asset-item')];
+      if (p.querySelector('.empty-state')) return true;
+      if (!before.size) return now.length > 0;
+      return now.some((b) => !before.has(b)) || now.every((b) => !b.isConnected) ? true : null;
+    }, ms, 120);
+    await sleep(250);
+  }
+
+  async function selectCategory(p, cat) {
+    if (!cat || cat === 'All') cat = 'All';
+    const before = new Set(p.querySelectorAll('button.asset-item'));
+    const filter = p.querySelector('button[aria-label="Filter by category"]') ||
+      [...p.querySelectorAll('button')].find((b) => iconText(b) === 'filter_list');
+    if (filter) {
+      if (isCategory(filter, cat)) return true;
+      filter.click();
+      const panel = await waitFor(() => (overlayRoot() || document).querySelector('.filter-panel'), 3000, 100);
+      if (!panel) return false;
+      const opt = [...panel.querySelectorAll('[role="option"], button, mat-option')].find((o) => isCategory(o, cat));
+      if (!opt) { await closeTopOverlay(); return false; }
+      opt.click();
+      await waitListChange(p, before);
+      return true;
+    }
+    const tabs = [...p.querySelectorAll('[role="tab"], mat-list-item[role="tab"]')];
+    const tab = tabs.find((t) => isCategory(t, cat));
+    if (!tab) return cat === 'All';
+    if (tab.getAttribute('aria-selected') === 'true') return true;
+    tab.click();
+    await waitListChange(p, before);
+    return true;
+  }
+
+  async function closeTopOverlay() {
+    (document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+    await sleep(250);
+  }
+
+  async function searchAssets(p, text) {
+    const input = p.querySelector('input[aria-label="Search assets"], input.search-input, input[type="search"]');
+    if (!input) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    const before = new Set(p.querySelectorAll('button.asset-item'));
+    input.focus();
+    setter.call(input, text);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(500);
+    await waitListChange(p, before, 2500);
+    return true;
+  }
+
+  function scroller(p) {
+    const root = p.querySelector('flow-add-menu-asset-list, cdk-virtual-scroll-viewport, .asset-list-viewport') || p;
+    return [root, ...root.querySelectorAll('*')].find((el) => {
+      const s = getComputedStyle(el);
+      return /(auto|scroll)/.test(s.overflowY) && el.scrollHeight > el.clientHeight + 10;
+    }) || null;
+  }
+
+  const cleanTitle = (s) => norm(s).replace(/(…|\.\.\.)+$/, '').replace(/\.(png|jpe?g|webp|gif|heic|mp4|webm)$/i, '').trim();
+  function titleScore(rowTitle, want) {
+    const a = cleanTitle(rowTitle), b = cleanTitle(want);
+    if (!a || !b) return 0;
+    if (a === b) return 3;
+    const truncated = /(…|\.\.\.)$/.test(String(rowTitle).trim());
+    if (truncated && a.length >= 6 && b.startsWith(a)) return 2;
+    if (b.length >= 6 && a.startsWith(b) && !/^[\p{L}\p{N}]/u.test(a.slice(b.length))) return 1;
+    return 0;
+  }
+
+  // 掃完整個（虛擬化）清單，收集最高分的所有候選；同分且是不同圖片時視為名稱不唯一
+  async function findAsset(p, name, { scroll = true } = {}) {
+    let bestScore = 0;
+    const cands = new Map(); // key -> row
+    const collect = () => {
+      for (const r of assetRows(p)) {
+        const s = titleScore(r.title, name);
+        if (!s || s < bestScore) continue;
+        if (s > bestScore) { bestScore = s; cands.clear(); }
+        cands.set(r.src || r.title, { ...r, score: s });
+      }
+    };
+    collect();
+    const sc = scroll && scroller(p);
+    if (sc) {
+      sc.scrollTop = 0;
+      sc.dispatchEvent(new Event('scroll'));
+      await sleep(300);
+      for (let i = 0; i < 60; i++) {
+        checkStop();
+        collect();
+        const prev = sc.scrollTop;
+        sc.scrollTop = prev + Math.max(200, sc.clientHeight * 0.8);
+        sc.dispatchEvent(new Event('scroll'));
+        await sleep(300);
+        if (sc.scrollTop === prev) { collect(); break; }
+      }
+    }
+    if (!cands.size) return null;
+    if (cands.size > 1) {
+      const err = new Error('名稱「' + name + '」對應到多個素材（' + [...cands.values()].slice(0, 5).map((r) => r.title).join('、') + '），請改用完整且唯一的名稱');
+      err.ambiguous = true;
+      throw err;
+    }
+    const hit = [...cands.values()][0];
+    // 節點可能被虛擬清單回收：點擊前重新找到同一個項目
+    if (!hit.btn.isConnected) {
+      const again = assetRows(p).find((r) => (r.src || r.title) === (hit.src || hit.title));
+      if (!again) {
+        if (sc) { sc.scrollTop = 0; await sleep(300); }
+        const third = assetRows(p).find((r) => (r.src || r.title) === (hit.src || hit.title));
+        return third ? { ...third, score: hit.score } : null;
+      }
+      return { ...again, score: hit.score };
+    }
+    return hit;
+  }
+
+  async function clickAssetIntoPrompt(row) {
+    const before = chips().length;
+    try { row.btn.scrollIntoView({ block: 'center' }); } catch (e) {}
+    row.btn.click();
+    await sleep(500);
+    const addBtn = (overlayRoot() || document).querySelector('button.detail-add-to-prompt-btn') ||
+      [...(overlayRoot() || document).querySelectorAll('button')].find((b) => visible(b) && /add to prompt|加入提示|新增至提示|添加到提示/i.test(b.textContent || ''));
+    if (addBtn && !isDisabled(addBtn)) { addBtn.click(); await sleep(300); }
+    const ok = await waitFor(() => chips().length > before || null, 6000, 150);
+    await waitFor(() => !chipsBusy() || null, 10000, 200);
+    if (picker()) await closeOverlays();
+    return !!ok;
+  }
+
+  async function attachByName(name, category) {
+    const p = await openPicker();
+    let hit = null;
+    const cats = category === 'Characters' ? ['Characters'] : [...new Set([category || 'All', 'All'])];
+    for (const cat of cats) {
+      if (!(await selectCategory(p, cat)) && cat !== 'All') continue;
+      await searchAssets(p, name);
+      hit = await findAsset(p, name);
+      if (hit) break;
+      await searchAssets(p, '');
+      hit = await findAsset(p, name);
+      if (hit) break;
+      if (cat === 'All') break;
+    }
+    if (!hit) { await closeOverlays(); return false; }
+    return clickAssetIntoPrompt(hit);
+  }
+
+  async function clearIngredients() {
+    for (let i = 0; i < 15; i++) {
+      checkStop();
+      const list = chips();
+      if (!list.length) return true;
+      const chip = list[0];
+      const n = list.length;
+      const x = chip.querySelector('.hover-icon-overlay, mat-icon, button[aria-label*="emove" i], button[aria-label*="lose" i]');
+      (x || chip).click();
+      await sleep(250);
+      if (chips().length < n) continue;
+      const btn = chip.querySelector('button.chip-container') || chip;
+      btn.click();
+      await sleep(250);
+      const menuItem = [...(overlayRoot() || document).querySelectorAll('[role="menuitem"], button')]
+        .find((e) => visible(e) && /^(remove|移除|從提示詞移除|移出|remove from prompt)$/i.test(norm(e.textContent).replace(/^(close|delete|remove_circle|cancel)\s+/, '')));
+      if (menuItem) menuItem.click(); else await closeOverlays();
+      await sleep(300);
+      if (chips().length >= n) { log('無法移除 Flow 上既有的素材，將保留', 'warn'); return false; }
+    }
+    return !chips().length;
+  }
+
+  async function readFile(fileId) {
+    const key = 'file:' + fileId;
+    const d = await chrome.storage.local.get(key);
+    if (!d[key]) throw new Error('找不到已儲存的參考圖（可能已被清除）');
+    return d[key];
+  }
+
+  async function uploadFile(ref) {
+    const rec = await readFile(ref.fileId);
+    const ext = (rec.mime.split('/')[1] || 'png').replace('jpeg', 'jpg').replace(/[^a-z0-9]/g, '') || 'png';
+    const uploadName = 'fq_' + ref.fileId + '.' + ext;
+    const hold = await send({ type: 'HOLD_FILE_CHOOSER' });
+    if (!hold.ok) throw new Error('無法準備上傳：' + hold.error);
+    const p = await openPicker();
+    await selectCategory(p, 'Uploads');
+    const up = [...(overlayRoot() || document).querySelectorAll('button')].find((b) =>
+      visible(b) && !b.closest('[role="tab"], [role="option"], .filter-panel') && b.getAttribute('role') !== 'tab' && (/upload media|上傳媒體|上传媒体|上傳|上传|upload/i.test(b.innerText || '') || iconText(b) === 'upload'));
+    if (!up) throw new Error('找不到 Flow 的「上傳」按鈕');
+    document.querySelectorAll('input[type="file"][data-fq-upload-target]').forEach((i) => i.removeAttribute('data-fq-upload-target'));
+    const beforeSrc = new Set(assetRows(p).map((r) => r.src).filter(Boolean));
+    const beforeToasts = new Set(toastTexts());
+    up.click();
+    const input = await waitFor(() => document.querySelector('input[type="file"][data-fq-upload-target]'), 4000, 120);
+    if (!input) throw new Error('Flow 沒有開啟上傳欄位（如果跳出了檔案視窗，請關閉它）');
+    input.removeAttribute('data-fq-upload-target');
+    const bin = atob(rec.base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const dt = new DataTransfer();
+    dt.items.add(new File([bytes], uploadName, { type: rec.mime }));
+    input.files = dt.files;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    const base = uploadName.replace(/\.[a-z0-9]+$/i, '');
+    const row = await waitFor(() => {
+      const t = toastTexts().find((x) => !beforeToasts.has(x) && classify(x));
+      if (t) return { refused: t };
+      const pk = picker();
+      if (!pk) return null;
+      const fresh = assetRows(pk).filter((r) => /^https?:/i.test(r.src) && !beforeSrc.has(r.src));
+      const named = fresh.find((r) => norm(r.title).includes(norm(base)));
+      if (named) return { ...named, exact: true };
+      // 標題看不出來時，只有在「剛好一個新項目」才接受，且不寫入快取
+      return fresh.length === 1 ? { ...fresh[0], exact: false } : null;
+    }, 90000, 500);
+    if (!row) throw new Error('上傳的參考圖 90 秒內沒有出現在 Flow');
+    if (row.refused) throw new Error('Flow 拒絕上傳：' + row.refused.slice(0, 120));
+    const title = row.title || base;
+    if (row.exact) {
+      const pid = projectId();
+      const { uploadCache = {} } = await chrome.storage.local.get('uploadCache');
+      uploadCache[pid] = { ...(uploadCache[pid] || {}), [ref.fileId]: title };
+      await chrome.storage.local.set({ uploadCache });
+    }
+    log('已上傳參考圖「' + (ref.name || uploadName) + '」');
+    // 上傳後若沒有自動加入提示詞框，就從清單點選加入
+    await sleep(800);
+    return { title, row };
+  }
+
+  async function attachRef(ref) {
+    const label = ref.name || ref.fileId || '';
+    if (ref.type === 'character') {
+      if (!(await attachByName(ref.name, 'Characters'))) throw new Error('找不到角色「' + label + '」');
+      return;
+    }
+    if (ref.type === 'asset') {
+      if (!(await attachByName(ref.name, ref.category || 'All'))) throw new Error('找不到素材「' + label + '」');
+      return;
+    }
+    if (ref.type === 'file') {
+      const pid = projectId();
+      const { uploadCache = {} } = await chrome.storage.local.get('uploadCache');
+      const cached = (uploadCache[pid] || {})[ref.fileId];
+      if (cached && (await attachByName(cached, 'Uploads'))) return;
+      const before = chips().length;
+      const { title, row } = await uploadFile(ref);
+      if (chips().length > before) { await waitFor(() => !chipsBusy() || null, 10000, 200); await closeOverlays(); return; }
+      if (picker() && row.btn.isConnected && (await clickAssetIntoPrompt(row))) return;
+      if (await attachByName(title, 'Uploads')) return;
+      throw new Error('參考圖「' + label + '」已上傳，但無法加入提示詞框');
+    }
+    throw new Error('不支援的素材類型：' + ref.type);
+  }
+
+  async function applyRefs(refs, settings) {
+    if (!refs || !refs.length) return;
+    if (settings.clearIngredients !== false && !(await clearIngredients())) throw new Error('無法清除 Flow 提示詞框上的既有素材（上傳後重試）');
+    for (const ref of refs) {
+      checkStop();
+      await attachRef(ref);
+    }
+    await closeOverlays();
+    await sleep(500);
+  }
+
+  async function listAssets({ category = 'All', search = '' } = {}) {
+    const p = await openPicker();
+    try {
+      await selectCategory(p, category);
+      if (search) await searchAssets(p, search);
+      const seen = new Map();
+      const collect = () => assetRows(p).forEach((r) => { if (r.title && !seen.has(r.title)) seen.set(r.title, { title: r.title, type: r.type, src: r.src.slice(0, 500) }); });
+      collect();
+      const sc = scroller(p);
+      if (sc) {
+        sc.scrollTop = 0;
+        await sleep(300);
+        for (let i = 0; i < 30 && seen.size < 300; i++) {
+          collect();
+          const prev = sc.scrollTop;
+          sc.scrollTop = prev + Math.max(200, sc.clientHeight * 0.8);
+          await sleep(300);
+          if (sc.scrollTop === prev) break;
+        }
+        collect();
+      }
+      return [...seen.values()];
+    } finally {
+      await closeOverlays();
+    }
+  }
+
+  // 同一時間只允許一個流程操作 Flow 介面（送出 vs. 列出素材）
+  let domLockChain = Promise.resolve();
+  let domBusy = 0;
+  function withDomLock(fn) {
+    const wrapped = async () => { domBusy++; try { return await fn(); } finally { domBusy--; } };
+    const run = domLockChain.then(wrapped, wrapped);
+    domLockChain = run.catch(() => {});
+    return run;
+  }
+
   // ---------------- runner ----------------
   let myTabId = null;
   let loopActive = false;
@@ -326,6 +688,29 @@
     if (!ed) throw new Error('找不到 Flow 的提示詞輸入框（請確認已開啟專案頁面）');
     await closeOverlays();
 
+    if (item.refs && item.refs.length) {
+      log(label + ' 加入 ' + item.refs.length + ' 個素材…');
+      try {
+        weAttached = true;
+        await applyRefs(item.refs, settings);
+        if (chips().length < item.refs.length) throw new Error('Flow 提示詞框上的素材數量不符（預期至少 ' + item.refs.length + ' 個）');
+        // 上傳的參考圖可能出現在專案網格：先認領，避免被其他生成中項目當成結果
+        for (const m of mediaTiles()) if (/fq_[0-9a-f]{16}/i.test(m.tile.innerText || '') || /fq_[0-9a-f]{16}/i.test(m.src)) claimedMedia.add(m.id);
+      } catch (e) {
+        if (e instanceof StopError) throw e;
+        await closeOverlays();
+        if (settings.clearIngredients !== false) await clearIngredients().catch(() => {});
+        return { ok: false, error: String((e && e.message) || e), retryable: /上傳|沒有打開|沒有出現|無法加入/.test(String(e && e.message)) };
+      }
+    }
+
+    else if (weAttached && settings.clearIngredients !== false) {
+      // 上一筆由佇列加入的素材不能帶到沒有素材的這一筆
+      if (!(await clearIngredients())) return { ok: false, error: '無法清除上一筆的素材，為避免送出錯誤素材已暫停此筆', retryable: true };
+      weAttached = false;
+    }
+
+    // 快照要在加入素材之後：上傳的參考圖也會出現在專案網格，不能被當成生成結果
     const base = snapshot();
     if (!(await setPrompt(item.prompt))) throw new Error('無法把提示詞填入 Flow 輸入框');
 
@@ -482,7 +867,7 @@
       const mine = pendTexts.filter((t) => t.includes(rec.prefix)).length;
       const anyNewPending = pend.some((t) => !rec.base.pending.has(t));
       const stillPending = mine > 0 || (single && anyNewPending && !pendTexts.some(Boolean));
-      if (stillPending) { rec.sawPending = true; rec.lastPendingAt = now; }
+      if (stillPending) { rec.sawPending = true; rec.lastPendingAt = now; rec.goneTicks = 0; }
 
       const newErrors = errors.filter((e) => !rec.base.errors.has(e) && !e.__flowQueueClaimed);
       const myErr = newErrors.find((e) => norm(e.innerText).includes(rec.prefix)) ||
@@ -511,7 +896,9 @@
           await completeItem(rec, fresh, settings);
           continue;
         }
-        if (rec.sawPending && sinceGone > 12000) {
+        rec.goneTicks = rec.sawPending ? (rec.goneTicks || 0) + 1 : 0;
+        // 用「實際觀察到的檢查次數」判斷，避免長時間上傳期間沒有檢查、一回來就誤判為無結果
+        if (rec.sawPending && sinceGone > 12000 && rec.goneTicks >= 8) {
           inflight.delete(rec.id);
           await completeItem(rec, [], settings);
           continue;
@@ -530,6 +917,7 @@
     }
   }
 
+  let weAttached = false; // 提示詞框上的素材是佇列加入的
   let ready = false; // 初始化（含重新載入後的接手）完成前不啟動執行器
   async function loop() {
     if (loopActive || !ready) return;
@@ -566,7 +954,7 @@
           if (claim.ok && claim.item) {
             const item = claim.item;
             try {
-              const r = await submitItem(item, settings);
+              const r = await withDomLock(() => submitItem(item, settings));
               if (!r.ok) await failItem(item.id, r.error, r.retryable, item.claimId);
             } catch (e) {
               if (e instanceof StopError) break;
@@ -596,6 +984,13 @@
     if (msg.type === 'PING') { sendResponse({ ok: true, editor: !!editor() }); return false; }
     if (msg.type === 'KICK') { stopFlag = false; loop(); sendResponse({ ok: true }); return false; }
     if (msg.type === 'STOP') { stopFlag = true; inflight.clear(); sendResponse({ ok: true }); return false; }
+    if (msg.type === 'LIST_ASSETS') {
+      if (domBusy) { sendResponse({ ok: false, error: '佇列正在操作 Flow 介面，請稍後再試（或先暫停）' }); return false; }
+      withDomLock(() => listAssets(msg))
+        .then((assets) => sendResponse({ ok: true, assets }))
+        .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+      return true;
+    }
     return false;
   });
 

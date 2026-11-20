@@ -1,4 +1,5 @@
 // Flow Queue — service worker
+try { importScripts('bridge-client.js'); } catch (e) { console.warn('bridge-client.js 載入失敗', e); }
 // 單一寫入者：所有佇列 / 設定 / 執行狀態的修改都經過這裡，避免側邊面板與內容腳本互相覆蓋。
 
 const FLOW_URL_RE = /^https:\/\/(?:flow\.google(?:\.com)?\/|labs\.google\/fx\/)/i;
@@ -16,8 +17,77 @@ const DEFAULT_SETTINGS = Object.freeze({
   trustedClick: true,    // 用 chrome.debugger 送出真實滑鼠點擊
   autoDownload: false,   // 完成後自動下載
   downloadFolder: 'FlowQueue',
-  splitMode: 'blank'     // blank：以空行分隔；line：每行一個
+  splitMode: 'blank',    // blank：以空行分隔；line：每行一個
+  clearIngredients: true, // 有素材的項目先清空 Flow 提示詞框上的既有素材
+  bridgeEnabled: false,  // 允許本機 AI 代理（Claude / Codex / agy）透過橋接控制（需配對碼）
+  bridgePort: 17345,
+  bridgeToken: ''        // 與 ~/.flow-queue/token 相同的配對碼，用來雙向驗證橋接程式
 });
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+function sniffImage(bytes) {
+  const b = (i) => bytes[i];
+  if (b(0) === 0x89 && b(1) === 0x50 && b(2) === 0x4e && b(3) === 0x47) return 'image/png';
+  if (b(0) === 0xff && b(1) === 0xd8 && b(2) === 0xff) return 'image/jpeg';
+  if (b(0) === 0x47 && b(1) === 0x49 && b(2) === 0x46) return 'image/gif';
+  if (b(0) === 0x52 && b(1) === 0x49 && b(2) === 0x46 && b(3) === 0x46 && b(8) === 0x57 && b(9) === 0x45 && b(10) === 0x42 && b(11) === 0x50) return 'image/webp';
+  const brand = String.fromCharCode(b(8), b(9), b(10), b(11));
+  if (String.fromCharCode(b(4), b(5), b(6), b(7)) === 'ftyp') {
+    if (/^(avif|avis)$/.test(brand)) return 'image/avif';
+    if (/^(heic|heix|mif1|msf1|heim|heis)$/.test(brand)) return 'image/heic';
+  }
+  return '';
+}
+const FILE_GC_GRACE_MS = 10 * 60 * 1000;
+const REF_CATEGORIES = new Set(['Images', 'Characters', 'Videos', 'Uploads', 'All']);
+
+function normalizeRefs(refs) {
+  const out = [];
+  for (const r of Array.isArray(refs) ? refs : []) {
+    if (!r || typeof r !== 'object') continue;
+    const name = String(r.name || '').trim().slice(0, 200);
+    if (r.type === 'character' && name) out.push({ type: 'character', name });
+    else if (r.type === 'asset' && name) out.push({ type: 'asset', name, category: REF_CATEGORIES.has(r.category) ? r.category : 'All' });
+    else if (r.type === 'file' && /^[0-9a-f]{16}$/.test(String(r.fileId || ''))) {
+      out.push({ type: 'file', fileId: r.fileId, name: name || r.fileId, mime: String(r.mime || 'image/png') });
+    }
+  }
+  return out.slice(0, 20);
+}
+
+async function storeFile(d, { name, mime, base64 }) {
+  base64 = String(base64 || '').replace(/^data:[^,]*,/, '');
+  const bin = atob(base64);
+  if (!bin.length) throw new Error('檔案是空的');
+  if (bin.length > MAX_FILE_BYTES) throw new Error('檔案超過 10 MB');
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  // 以檔案內容判斷格式，不相信宣告的 mime
+  mime = sniffImage(bytes);
+  if (!mime) throw new Error('只支援圖片檔（png / jpg / webp / gif / avif / heic）');
+  const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const fileId = hash.slice(0, 16);
+  const key = 'file:' + fileId;
+  const safe = String(name || fileId).replace(/[\u0000-\u001f]/g, '').slice(0, 120);
+  if (!(d.meta.files || {})[fileId]) {
+    await chrome.storage.local.set({ [key]: { name: safe, mime, base64, size: bin.length, createdAt: Date.now() } });
+  }
+  d.meta.files = { ...(d.meta.files || {}), [fileId]: Date.now() };
+  return { fileId, name: safe, mime, size: bin.length };
+}
+
+// 刪掉沒有任何佇列項目引用、且超過寬限時間的參考圖（寬限避免剛上傳、還沒加入佇列就被刪）
+async function gcFiles(d) {
+  const used = new Set();
+  for (const it of d.queue) for (const r of it.refs || []) if (r.type === 'file') used.add(r.fileId);
+  const files = d.meta.files || {};
+  const now = Date.now();
+  const drop = Object.keys(files).filter((id) => !used.has(id) && now - files[id] > FILE_GC_GRACE_MS);
+  if (!drop.length) return;
+  await chrome.storage.local.remove(drop.map((id) => 'file:' + id));
+  for (const id of drop) delete files[id];
+  d.meta.files = files;
+}
 const DEFAULT_RUN = Object.freeze({ state: 'idle', tabId: null, cooldownUntil: 0, message: '' });
 const KEYS = ['queue', 'settings', 'run', 'logs', 'meta'];
 const MAX_LOGS = 300;
@@ -182,14 +252,23 @@ const handlers = {
   GET_TAB_ID: async (msg, sender) => ({ tabId: sender.tab ? sender.tab.id : null }),
 
   ADD_ITEMS: (msg) => mutate((d) => {
-    const prompts = (Array.isArray(msg.prompts) ? msg.prompts : [])
-      .map((p) => String(p || '').trim())
-      .filter(Boolean);
+    const batchRefs = normalizeRefs(msg.refs);
+    const entries = (Array.isArray(msg.prompts) ? msg.prompts : [])
+      .map((p) => (p && typeof p === 'object')
+        ? { prompt: String(p.prompt || '').trim(), refs: normalizeRefs([...batchRefs, ...(p.refs || [])]) }
+        : { prompt: String(p || '').trim(), refs: batchRefs })
+      .filter((e) => e.prompt);
+    const known = d.meta.files || {};
+    for (const e of entries) {
+      const missing = e.refs.find((r) => r.type === 'file' && !known[r.fileId]);
+      if (missing) throw new Error('參考圖不存在，請重新附加：' + missing.name);
+    }
     const now = Date.now();
-    const items = prompts.map((prompt) => ({
+    const items = entries.map(({ prompt, refs }) => ({
       id: crypto.randomUUID(),
       seq: ++d.meta.seq,
       prompt,
+      refs,
       status: 'pending',
       attempts: 0,
       error: '',
@@ -202,15 +281,16 @@ const handlers = {
     } else {
       d.queue.push(...items);
     }
-    if (items.length) addLog(d, '已加入 ' + items.length + ' 筆提示詞');
-    return { added: items.length };
+    if (items.length) addLog(d, '已加入 ' + items.length + ' 筆提示詞' + (batchRefs.length ? '（每筆 ' + batchRefs.length + ' 個素材）' : ''));
+    return { added: items.length, ids: items.map((it) => it.id) };
   }),
 
-  REMOVE_ITEMS: (msg) => mutate((d) => {
+  REMOVE_ITEMS: (msg) => mutate(async (d) => {
     const ids = new Set(msg.ids || []);
     const before = d.queue.length;
     d.queue = d.queue.filter((it) => !ids.has(it.id) || it.status === 'running');
     if (before - d.queue.length < ids.size) addLog(d, '執行中的項目無法刪除，請先停止', 'warn');
+    await gcFiles(d);
     return { removed: before - d.queue.length };
   }),
 
@@ -236,7 +316,7 @@ const handlers = {
   }),
 
   RETRY_ITEMS: (msg) => mutate((d) => {
-    const ids = msg.ids ? new Set(msg.ids) : null;
+    const ids = Array.isArray(msg.ids) && msg.ids.length ? new Set(msg.ids) : null;
     const statuses = new Set(msg.statuses || ['failed', 'unknown', 'stopped']);
     let n = 0;
     for (const it of d.queue) {
@@ -249,7 +329,7 @@ const handlers = {
     return { retried: n };
   }),
 
-  CLEAR: (msg) => mutate((d) => {
+  CLEAR: (msg) => mutate(async (d) => {
     const mode = msg.mode || 'done';
     const keep = (it) => {
       if (it.status === 'running') return true;
@@ -259,13 +339,16 @@ const handlers = {
     };
     const before = d.queue.length;
     d.queue = d.queue.filter(keep);
+    await gcFiles(d);
     return { removed: before - d.queue.length };
   }),
 
   CLEAR_LOGS: () => mutate((d) => { d.logs = []; return {}; }),
 
   SET_SETTINGS: (msg) => mutate((d) => {
-    const s = { ...d.settings, ...(msg.patch || {}) };
+    const patch = {};
+    for (const [k, v] of Object.entries(msg.patch || {})) if (k in DEFAULT_SETTINGS) patch[k] = v;
+    const s = { ...d.settings, ...patch };
     const num = (v, lo, hi, def) => {
       const n = Number(v);
       return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def;
@@ -280,11 +363,72 @@ const handlers = {
     s.autoDownload = !!s.autoDownload;
     s.downloadFolder = safeFolder(s.downloadFolder) || 'FlowQueue';
     s.splitMode = s.splitMode === 'line' ? 'line' : 'blank';
+    s.clearIngredients = s.clearIngredients !== false;
+    s.bridgeEnabled = !!s.bridgeEnabled;
+    s.bridgePort = Math.round(num(s.bridgePort, 1024, 65535, 17345));
+    s.bridgeToken = /^[0-9a-f]{64}$/i.test(String(s.bridgeToken || '').trim()) ? String(s.bridgeToken).trim().toLowerCase() : '';
     d.settings = s;
     return { settings: s };
   }),
 
   LOG: (msg) => mutate((d) => { addLog(d, msg.text, msg.level); return {}; }),
+
+  ADD_FILE: (msg) => mutate((d) => storeFile(d, msg)),
+
+  GET_FILE: async (msg) => {
+    const key = 'file:' + String(msg.fileId || '');
+    const r = await chrome.storage.local.get(key);
+    if (!r[key]) throw new Error('找不到檔案');
+    return { file: r[key] };
+  },
+
+  LIST_ASSETS: async (msg) => {
+    const tabId = msg.tabId != null ? Number(msg.tabId) : await pickFlowTab();
+    if (tabId == null) throw new Error('請先開啟 Google Flow 專案頁面');
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || !FLOW_URL_RE.test(tab.url || '')) throw new Error('指定的分頁不是 Google Flow');
+    await ensureContentScript(tabId);
+    const r = await withTimeout(chrome.tabs.sendMessage(tabId, { type: 'LIST_ASSETS', category: msg.category || 'All', search: msg.search || '' }), 50000, '讀取素材清單');
+    if (!r || !r.ok) throw new Error((r && r.error) || 'Flow 分頁沒有回應');
+    return { assets: r.assets || [] };
+  },
+
+  BRIDGE_STATUS: async () => ({ bridge: (await chrome.storage.local.get('bridge')).bridge || { connected: false } }),
+
+  // 在頁面主世界攔截 file input 的 click：不跳出系統檔案視窗，只標記該欄位，讓內容腳本直接放入檔案
+  HOLD_FILE_CHOOSER: async (msg, sender) => {
+    const tabId = sender.tab && sender.tab.id;
+    if (tabId == null || !FLOW_URL_RE.test(sender.tab.url || '')) throw new Error('不是 Flow 分頁');
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        const proto = HTMLInputElement.prototype;
+        if (proto.click.__fqHeld) return;
+        const original = proto.click;
+        const held = function (...args) {
+          if (this.type !== 'file') return original.apply(this, args);
+          this.setAttribute('data-fq-upload-target', String(Date.now()));
+          if (proto.click === held) proto.click = original; // 只攔截一次
+        };
+        held.__fqHeld = true;
+        proto.click = held;
+        const originalPicker = proto.showPicker;
+        if (originalPicker) {
+          proto.showPicker = function (...args) {
+            if (this.type !== 'file') return originalPicker.apply(this, args);
+            this.setAttribute('data-fq-upload-target', String(Date.now()));
+            proto.showPicker = originalPicker;
+          };
+        }
+        setTimeout(() => {
+          if (proto.click === held) proto.click = original;
+          if (originalPicker) proto.showPicker = originalPicker;
+        }, 15000);
+      }
+    });
+    return {};
+  },
 
   // 內容腳本：取出下一筆待處理並標記為執行中（原子操作）
   CLAIM_NEXT: (msg, sender) => mutate((d) => {
@@ -476,3 +620,118 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     await handlers.STOP({ reason: '目標 Flow 分頁已關閉，已停止', level: 'warn' });
   }
 });
+
+// ---------- target tab ----------
+async function pickFlowTab() {
+  const ok = (t) => t && FLOW_URL_RE.test(t.url || '') && /\/project\//.test(t.url || '');
+  const { run } = await chrome.storage.local.get('run');
+  if (run && run.tabId != null) {
+    try { const t = await chrome.tabs.get(run.tabId); if (ok(t)) return t.id; } catch (e) {}
+  }
+  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (ok(active)) return active.id;
+  const any = (await chrome.tabs.query({})).find(ok);
+  return any ? any.id : null;
+}
+
+// ---------- API for the local bridge (bridge-client.js) ----------
+function unwrap(r) {
+  if (!r || r.ok === false) throw new Error((r && r.error) || '失敗');
+  const { ok, ...rest } = r;
+  return rest;
+}
+const callHandler = async (type, msg = {}) => unwrap(await handlers[type]({ type, ...msg }, { id: chrome.runtime.id })
+  .then((r) => ({ ok: true, ...(r || {}) }), (e) => ({ ok: false, error: String((e && e.message) || e) })));
+// 配對碼不能透過橋接回傳給 AI 代理，也不能被代理修改
+const publicSettings = (s) => { const { bridgeToken, ...rest } = s || {}; return { ...rest, bridgePaired: !!bridgeToken }; };
+const BRIDGE_LOCKED_KEYS = new Set(['bridgeEnabled', 'bridgePort', 'bridgeToken']);
+const stripItem = (it) => ({ ...it, results: (it.results || []).map((r) => ({ src: r.src, isVideo: r.isVideo })) });
+
+const recentAdds = new Map(); // requestId -> {at, result}：避免代理重試造成重複加入
+globalThis.FQ = {
+  async call(method, params = {}) {
+    params = params && typeof params === 'object' ? params : {};
+    switch (method) {
+      case 'status': {
+        const d = withDefaults(await chrome.storage.local.get([...KEYS, 'bridge']));
+        const counts = { total: d.queue.length, pending: 0, running: 0, done: 0, failed: 0, unknown: 0, stopped: 0 };
+        for (const it of d.queue) if (it.status in counts) counts[it.status]++;
+        const flowTabs = (await chrome.tabs.query({})).filter((t) => FLOW_URL_RE.test(t.url || ''))
+          .map((t) => ({ tabId: t.id, title: t.title, url: t.url }));
+        return { run: d.run, settings: publicSettings(d.settings), counts, flowTabs, bridge: d.bridge || null };
+      }
+      case 'list': {
+        const { queue = [] } = await chrome.storage.local.get('queue');
+        const want = params.status ? new Set([].concat(params.status)) : null;
+        const all = want ? queue.filter((it) => want.has(it.status)) : queue;
+        const offset = Math.max(0, Number(params.offset) || 0);
+        const limit = Math.min(1000, Math.max(1, Number(params.limit) || 100));
+        return { items: all.slice(offset, offset + limit).map(stripItem), total: all.length };
+      }
+      case 'get': {
+        const { queue = [] } = await chrome.storage.local.get('queue');
+        const it = queue.find((x) => x.id === params.id);
+        if (!it) throw new Error('找不到項目：' + params.id);
+        return { item: stripItem(it) };
+      }
+      case 'uploadFile': return callHandler('ADD_FILE', params);
+      case 'add': {
+        const rid = typeof params.requestId === 'string' ? params.requestId.slice(0, 100) : '';
+        // 同步檢查並登記（中間不能有 await），同時到達的重複請求才會共用同一個結果
+        if (rid && recentAdds.has(rid)) return recentAdds.get(rid).promise;
+        const work = (async () => {
+        if (rid) {
+          const persisted = (await chrome.storage.session.get('recentAdds')).recentAdds || {};
+          if (persisted[rid] && Date.now() - persisted[rid].at < 600000) return { ...persisted[rid].result, deduped: true };
+        }
+        const refs = Array.isArray(params.refs) ? [...params.refs] : [];
+        for (const f of Array.isArray(params.files) ? params.files : []) {
+          const r = await callHandler('ADD_FILE', f);
+          refs.push({ type: 'file', fileId: r.fileId, name: r.name, mime: r.mime });
+        }
+        return callHandler('ADD_ITEMS', { prompts: params.prompts, refs, toTop: !!params.toTop });
+        })();
+        if (!rid) return work;
+        const now = Date.now();
+        for (const [k, v] of recentAdds) if (now - v.at > 600000) recentAdds.delete(k);
+        recentAdds.set(rid, { at: now, promise: work });
+        try {
+          const result = await work;
+          const persisted = (await chrome.storage.session.get('recentAdds')).recentAdds || {};
+          for (const k of Object.keys(persisted)) if (now - persisted[k].at > 600000) delete persisted[k];
+          persisted[rid] = { at: now, result };
+          await chrome.storage.session.set({ recentAdds: persisted });
+          return result;
+        } catch (e) {
+          recentAdds.delete(rid);
+          throw e;
+        }
+      }
+      case 'start': {
+        const tabId = params.tabId != null ? Number(params.tabId) : await pickFlowTab();
+        if (tabId == null) throw new Error('沒有開啟的 Google Flow 專案分頁');
+        await callHandler('START', { tabId });
+        return { tabId };
+      }
+      case 'pause': return callHandler('PAUSE');
+      case 'stop': return callHandler('STOP', { reason: params.reason });
+      // 預設不重試「未確認」：那些可能已經在 Flow 生成過，重送會重複扣點數
+      case 'retry': return callHandler('RETRY_ITEMS', { ids: params.ids, statuses: params.statuses || ['failed', 'stopped'] });
+      case 'remove': return callHandler('REMOVE_ITEMS', { ids: params.ids || [] });
+      case 'clear': return callHandler('CLEAR', { mode: params.mode || 'done' });
+      case 'move': return callHandler('MOVE_ITEM', params);
+      case 'settings': {
+        const patch = {};
+        for (const [k, v] of Object.entries(params.patch || {})) if (!BRIDGE_LOCKED_KEYS.has(k)) patch[k] = v;
+        if (Object.keys(patch).length) return { settings: publicSettings((await callHandler('SET_SETTINGS', { patch })).settings) };
+        return { settings: publicSettings(withDefaults(await chrome.storage.local.get(['settings'])).settings) };
+      }
+      case 'logs': {
+        const { logs = [] } = await chrome.storage.local.get('logs');
+        return { logs: logs.slice(-Math.min(300, Math.max(1, Number(params.limit) || 50))) };
+      }
+      case 'listAssets': return callHandler('LIST_ASSETS', params);
+      default: throw new Error('未知的方法：' + method);
+    }
+  }
+};

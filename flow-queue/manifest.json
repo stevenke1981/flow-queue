@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Flow Queue",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5znNejF1PjKWnreSuyiLc6WEsUdY4mxpCxXAGBgikMb3OpZ2GECQgFRe/1ksOm/Tg3KphAgq6gwRZwVVCCuoOItLfnBAMtWLM1Cuz0YtlZCz2GmDaXaCYm9Ngru94tQbnOC5YqIEbfncjrbxnY6429wOwxF6y0fAgdCy6KDY1X6e73ltzZTcu0/l2MwpQNENjSGaY/mK24vA1VJKkNOqJavNlXppmrGT+xxeguzalgPSK/CZDKIamguNfjrQ+0zeLXdR1JHsosIlRdU9xnsAxLauDlMxk711Rpe0SMTpRS2x1lsEG6Z5Bvq1uZsMB2bwmTlDgZxggMn4rYEEyVKD6QIDAQAB",
   "description": "Google Flow 提示詞排隊工具：批次送出、自動等待完成、失敗重試、自動下載。不需登入，直接使用瀏覽器目前的 Google 帳號。",
   "minimum_chrome_version": "116",
   "action": {
