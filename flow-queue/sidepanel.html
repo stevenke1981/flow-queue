@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flow Queue</title>
+<link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+<header class="hdr">
+  <div class="hdr-row">
+    <h1>Flow Queue</h1>
+    <span id="chip" class="chip idle">閒置</span>
+    <span id="cooldown" class="cooldown" hidden></span>
+  </div>
+  <div id="runMsg" class="muted small"></div>
+  <div id="tabTitle" class="muted small ellipsis" hidden></div>
+</header>
+<div id="toast" class="toast" hidden></div>
+
+<section class="card">
+  <textarea id="input" rows="5" placeholder="貼上提示詞（Ctrl+Enter 加入佇列）"></textarea>
+  <div class="row">
+    <select id="splitMode" title="分割方式">
+      <option value="blank">以空行分隔</option>
+      <option value="line">每行一個</option>
+    </select>
+    <label class="btn file-btn">匯入 .txt<input type="file" id="file" accept=".txt,text/plain" hidden></label>
+    <span id="count" class="muted small grow right">將加入 0 筆</span>
+  </div>
+  <div class="row">
+    <button id="add" class="btn primary grow">加入佇列</button>
+    <button id="addTop" class="btn grow">插到最前</button>
+  </div>
+</section>
+
+<section class="card">
+  <div class="row">
+    <button id="start" class="btn primary grow">開始</button>
+    <button id="pause" class="btn grow">暫停</button>
+    <button id="stop" class="btn danger grow">停止</button>
+  </div>
+  <div class="stats">
+    <div><b id="sTotal">0</b><span>全部</span></div>
+    <div><b id="sPending">0</b><span>待處理</span></div>
+    <div><b id="sRunning">0</b><span>執行中</span></div>
+    <div><b id="sDone">0</b><span>完成</span></div>
+    <div><b id="sFailed">0</b><span title="含未確認、已停止">失敗/未確認</span></div>
+  </div>
+  <div class="bar"><div id="barFill"></div></div>
+</section>
+
+<section class="card">
+  <div id="list" class="list"></div>
+  <div id="empty" class="muted center">佇列是空的</div>
+  <div class="row wrap bulk">
+    <button id="clrDone" class="btn small">清除已完成</button>
+    <button id="retryFailed" class="btn small">重試失敗</button><!-- 只重試「失敗」；「未確認」可能已生成，請逐筆重試 -->
+    <button id="clrFailed" class="btn small">清除失敗</button>
+    <button id="copyFailed" class="btn small">複製失敗提示詞</button>
+    <button id="clrAll" class="btn small danger">清空全部</button>
+  </div>
+</section>
+
+<details class="card">
+  <summary>設定</summary>
+  <div class="form">
+    <label>同時生成數 <input type="number" id="maxConcurrent" min="1" max="10" step="1"></label>
+    <label>送出間隔 秒
+      <span class="pair"><input type="number" id="delayMin" min="0" step="1"> ~ <input type="number" id="delayMax" min="0" step="1"></span></label>
+    <label>單筆逾時 分鐘 <input type="number" id="timeoutMin" min="1" step="1"></label>
+    <label>失敗重試次數 <input type="number" id="retries" min="0" max="10" step="1"></label>
+    <label>限流冷卻 秒 <input type="number" id="cooldownSec" min="10" step="10"></label>
+    <label class="chk"><input type="checkbox" id="trustedClick"> 使用真實點擊 (debugger)</label>
+    <div class="muted small hint">會顯示「正在偵錯此瀏覽器」提示，較穩定</div>
+    <label class="chk"><input type="checkbox" id="autoDownload"> 完成後自動下載</label>
+    <label>下載資料夾 <input type="text" id="downloadFolder" placeholder="FlowQueue"></label>
+    <div class="muted small hint">相對於 Chrome 下載目錄</div>
+  </div>
+</details>
+
+<details class="card">
+  <summary>記錄</summary>
+  <div class="row"><button id="clrLogs" class="btn small">清除記錄</button></div>
+  <div id="logs" class="logs"></div>
+</details>
+
+<p class="tip muted small">提示：Flow 分頁保持在前景執行最穩定；模型、比例、數量請先在 Flow 介面設定好，佇列會沿用目前設定。</p>
+<script src="sidepanel.js"></script>
+</body>
+</html>

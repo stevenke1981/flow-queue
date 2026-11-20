@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "Flow Queue",
+  "version": "1.0.0",
+  "description": "Google Flow 提示詞排隊工具：批次送出、自動等待完成、失敗重試、自動下載。不需登入，直接使用瀏覽器目前的 Google 帳號。",
+  "minimum_chrome_version": "116",
+  "action": {
+    "default_title": "開啟 Flow Queue",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "sidePanel",
+    "tabs",
+    "scripting",
+    "debugger",
+    "downloads",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://flow.google.com/*",
+    "https://flow.google/*",
+    "https://labs.google/*",
+    "https://flow-content.google/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://flow.google.com/*",
+        "https://flow.google/*",
+        "https://labs.google/fx/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+Q",
+        "mac": "Alt+Shift+Q"
+      },
+      "description": "開啟 Flow Queue 面板"
+    }
+  }
+}

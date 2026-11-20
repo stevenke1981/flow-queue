@@ -1,0 +1,6 @@
+# Google Docs Offline 擴充功能的副本（不屬於本專案）
+/1.110.1_0/
+/1.112.1_0/
+node_modules/
+*.pem
+.env
