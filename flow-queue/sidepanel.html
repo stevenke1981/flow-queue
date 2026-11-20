@@ -230,7 +230,7 @@
         <label for="bridgeEnabled">允許 AI 代理控制<span class="hint">讓本機的 Claude、Codex 等代理透過橋接程式操作佇列。</span></label>
         <input type="checkbox" role="switch" id="bridgeEnabled" class="switch">
       </div>
-      <div class="set set-stack"><label for="bridgeToken">配對碼<span class="hint">在終端機執行 flowq pair 取得配對碼</span></label>
+      <div class="set set-stack"><label for="bridgeToken">配對碼<span class="hint">在終端機執行 flowq pair --copy，配對碼會複製到剪貼簿</span></label>
         <span class="secret">
           <input type="password" id="bridgeToken" autocomplete="off" spellcheck="false" placeholder="貼上 64 字元配對碼" aria-describedby="tokenErr">
           <button id="tokenToggle" class="icon-btn" type="button" aria-label="顯示配對碼" aria-pressed="false" aria-controls="bridgeToken">

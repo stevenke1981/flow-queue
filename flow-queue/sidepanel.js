@@ -1229,13 +1229,20 @@ for (const k of SETTING_IDS) {
 }
 for (const k of SETTING_CHK) $(k).addEventListener('change', () => saveSetting({ [k]: $(k).checked }));
 
-$('bridgeToken').addEventListener('input', validateTokenField);
-$('bridgeToken').addEventListener('change', async () => {
-  const v = $('bridgeToken').value.trim();
-  if (!validateTokenField()) return; // 欄位下方已顯示原因
-  const r = await saveSetting({ bridgeToken: v.toLowerCase() });
+// 貼上完整的配對碼就立刻儲存，不必等欄位失去焦點（貼上後直接關閉面板也不會遺失）
+let savedToken = null;
+async function saveToken() {
+  const v = $('bridgeToken').value.trim().toLowerCase();
+  if (!validateTokenField() || v === savedToken) return; // 欄位下方已顯示原因
+  savedToken = v;
+  const r = await saveSetting({ bridgeToken: v });
   if (r) toast(v ? '已儲存配對碼' : '已清除配對碼', true);
+  else savedToken = null;
+}
+$('bridgeToken').addEventListener('input', () => {
+  if (validateTokenField() && TOKEN_RE.test($('bridgeToken').value.trim())) saveToken();
 });
+$('bridgeToken').addEventListener('change', saveToken);
 $('tokenToggle').addEventListener('click', () => {
   const inp = $('bridgeToken');
   const show = inp.type === 'password';
