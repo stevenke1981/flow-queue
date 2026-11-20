@@ -217,6 +217,7 @@
           res = { type: 'res', id, ok: true, result: result === undefined ? null : result };
         } catch (e) {
           res = { type: 'res', id, ok: false, error: String((e && e.message) || e || 'error') };
+          if (e && typeof e.code === 'string' && e.code) res.code = e.code; // stable error code (DESIGN §10)
         }
         if (myGen !== gen) return;
         send(res);

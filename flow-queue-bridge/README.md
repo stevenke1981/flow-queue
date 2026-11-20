@@ -1,213 +1,135 @@
-# flow-queue-bridge — 讓 AI 代理操作 Flow Queue
+# flow-queue-bridge — 元件說明
 
-這個資料夾是 Flow Queue 擴充功能的「本機橋接程式」，讓 Claude Code、OpenAI Codex CLI、Google Antigravity（agy）等 AI 代理，
-透過 MCP 工具（或 `flowq` 指令）把提示詞加入佇列、開始／暫停、查看進度與結果。
-
-- 純 Node.js，**零相依套件**（Node 18 以上；建議 22+）。
-- 只監聽 `127.0.0.1:17345`（可用環境變數 `FLOW_QUEUE_PORT` 修改）。
-- 擴充功能與橋接程式之間用**配對碼**雙向驗證（HMAC-SHA256），網頁無法冒用。
+Flow Queue 擴充功能的本機橋接程式：讓 AI 代理（Claude Code、Codex CLI、Antigravity `agy`…）透過 **MCP 工具**或 **`flowq` 指令**操作 Google Flow 佇列。
+純 Node.js（18+，建議 22+），零相依套件；只監聽 `127.0.0.1:17345`（環境變數 `FLOW_QUEUE_PORT` 可改）。
+代理的操作規則在 [agent-instructions.md](agent-instructions.md)（MCP `initialize` 會回傳它，`flowq agent-guide` 也會印出）。
 
 ```
-AI 代理 ──stdio──▶ mcp.js ──HTTP + Bearer token──▶ server.js（常駐） ◀──WebSocket（配對驗證）── Chrome 擴充功能
+AI 代理 ──stdio──▶ mcp.js ──HTTP + Bearer token──▶ server.js（常駐） ◀──WebSocket（配對碼雙向驗證）── Chrome 擴充功能
 flowq（cli.js） ─────────────┘
 ```
 
 | 檔案 | 用途 |
 |---|---|
-| `server.js` | 常駐程式：HTTP API（`/api/health`、`/api/call`）＋ 給擴充功能連線的 WebSocket（`/ext`） |
-| `mcp.js` | MCP 伺服器（stdio）。啟動時若常駐程式沒在跑，會自動在背景啟動它 |
+| `server.js` | 常駐程式：`GET /api/health`、`POST /api/call`，以及給擴充功能的 WebSocket `/ext` |
+| `mcp.js` | MCP 伺服器（stdio，protocol 2025-06-18）；常駐程式沒在跑會自動在背景啟動 |
 | `cli.js` | 指令列工具 `flowq` |
-| `lib.js` | 共用程式（token、HTTP、啟動常駐程式、讀取圖片） |
+| `lib.js` | 共用：token、HTTP、啟動常駐程式、圖片讀取（SSRF 防護）、錯誤代碼、doctor、wait |
+| `install.js` | `flowq install-mcp` 的實作 |
+| `agent-instructions.md` | 給代理的操作規則（單一來源） |
 | `test/smoke.js` | 自動測試：`node test/smoke.js` |
 
----
+## 安裝與配對（人工步驟）
 
-## 1. 第一次設定：配對
+1. 安裝並啟用 Flow Queue 擴充功能。
+2. 複製配對碼到剪貼簿（不會顯示在畫面上）：`node G:/flow_extension/flow-queue-bridge/cli.js pair --copy`
+3. Flow Queue 側邊面板 →「設定」→「AI 代理橋接」：勾選「允許 AI 代理控制」，在「配對碼」貼上。
+4. 註冊 MCP 伺服器（會先備份被修改的設定檔 `<檔案>.bak-<時間>`；可重複執行）：
+   `node G:/flow_extension/flow-queue-bridge/cli.js install-mcp all`（先看會改什麼：加 `--dry-run`）
+5. 檢查：`node G:/flow_extension/flow-queue-bridge/cli.js doctor --human`
 
-1. 在 Chrome 安裝（或重新載入）Flow Queue 擴充功能。
-2. 在終端機取得配對碼（第一次執行時會自動產生，存放於 `~/.flow-queue/token`，Windows 為 `%USERPROFILE%\.flow-queue\token`）：
+配對碼存在 `~/.flow-queue/token`（Windows：`%USERPROFILE%\.flow-queue\token`），等同密碼，不要貼到聊天或網路上。
+外流時：刪除該檔、結束 `node … server.js` 程序，再重新執行 `flowq pair --copy` 並貼上。
+（選擇性）在此資料夾執行 `npm link`，即可直接使用 `flowq` 與 `flow-queue-mcp` 指令。
 
-   ```powershell
-   node G:/flow_extension/flow-queue-bridge/cli.js pair
-   ```
+### install-mcp 會寫入的位置
 
-3. 打開 Flow Queue 側邊面板 → 設定中的「AI 橋接」→ 貼上這串 64 個字元的配對碼，並**勾選啟用橋接**（預設為關閉）。
-4. 啟動常駐程式（AI 代理呼叫 MCP 時也會自動啟動，這一步可省略）：
+| 目標 | 方式 |
+|---|---|
+| `claude` | 有 `claude` 指令時執行 `claude mcp add --scope user flow-queue -- <node> <mcp.js>`；找不到則略過並印出手動指令 |
+| `codex` | `~/.codex/config.toml` 的 `[mcp_servers.flow-queue]`（只更新 command/args，保留你加的其他鍵；新建時加上 `tool_timeout_sec = 120`） |
+| `agy` | `~/.gemini/config/mcp_config.json` 的 `mcpServers["flow-queue"]`；若舊版路徑 `~/.gemini/antigravity-cli/mcp_config.json` 存在也一併更新 |
 
-   ```powershell
-   node G:/flow_extension/flow-queue-bridge/cli.js status
-   ```
+指令與路徑都用絕對路徑（node 執行檔與 mcp.js）。Antigravity 的路徑依
+[官方 MCP 文件](https://antigravity.google/docs/mcp/)（全域 `~/.gemini/config/mcp_config.json`、工作區 `.agents/mcp_config.json`，格式為 `mcpServers` 物件）；
+舊路徑見 [Arm 安裝指南](https://learn.arm.com/install-guides/antigravity/)。在 agy 中輸入 `/mcp` 可查看狀態。
 
-   側邊面板顯示「已連線」即完成。擴充功能每 30 秒會自動重試連線，常駐程式晚一點才啟動也沒關係。
+手動設定（不用 install-mcp 時）：
 
-> 配對碼等同密碼：任何拿到它的本機程式都能操作你的佇列。不要貼到網路上；若外流，刪除 `~/.flow-queue/token`、
-> 結束常駐程式（工作管理員中的 `node … server.js`）後重新執行 `flowq pair`，再到側邊面板貼上新的配對碼。
-
-（選擇性）安裝成全域指令：在此資料夾執行 `npm link`，之後就能直接用 `flowq` 與 `flow-queue-mcp`。
-以下範例都用絕對路徑 `node G:/flow_extension/flow-queue-bridge/mcp.js`，不需要安裝。
-
----
-
-## 2. 接上 AI 代理
-
-### Claude Code
-
-```powershell
-claude mcp add flow-queue -- node G:/flow_extension/flow-queue-bridge/mcp.js
 ```
-
-想讓所有專案都能用，加上 `--scope user`：`claude mcp add --scope user flow-queue -- node G:/flow_extension/flow-queue-bridge/mcp.js`。
-在 Claude Code 中輸入 `/mcp` 可確認 `flow-queue` 已連線。
-
-### OpenAI Codex CLI
-
-編輯 `~/.codex/config.toml`（Windows：`%USERPROFILE%\.codex\config.toml`），加入：
-
+claude mcp add --scope user flow-queue -- node G:/flow_extension/flow-queue-bridge/mcp.js
+```
 ```toml
+# ~/.codex/config.toml
 [mcp_servers.flow-queue]
 command = "node"
 args = ["G:/flow_extension/flow-queue-bridge/mcp.js"]
-# 選填：工具逾時（秒）。flow_wait 每次最多等約 45 秒就會回傳，預設值即可。
-# tool_timeout_sec = 60
+tool_timeout_sec = 120
 ```
-
-在 Codex 中輸入 `/mcp` 可查看已載入的伺服器。
-
-### Google Antigravity CLI（`agy`）
-
-依 Google 官方文件，Antigravity CLI 從兩個 JSON 檔讀取 MCP 伺服器設定，格式為頂層 `mcpServers` 物件，
-本機 stdio 伺服器使用 `command`／`args`／`env` 欄位：
-
-- 全域（所有專案）：`~/.gemini/config/mcp_config.json`（Windows：`%USERPROFILE%\.gemini\config\mcp_config.json`）
-- 單一工作區：`<工作區>/.agents/mcp_config.json`
-
 ```json
-{
-  "mcpServers": {
-    "flow-queue": {
-      "command": "node",
-      "args": ["G:/flow_extension/flow-queue-bridge/mcp.js"]
-    }
-  }
-}
+{ "mcpServers": { "flow-queue": { "command": "node", "args": ["G:/flow_extension/flow-queue-bridge/mcp.js"] } } }
 ```
 
-存檔後在 `agy` 中輸入 `/mcp` 開啟 MCP 管理介面，確認狀態或重新載入設定。注意事項：
+## MCP 工具
 
-- JSON 不能有註解。
-- 較舊版本的 agy 使用 `~/.gemini/antigravity-cli/mcp_config.json`；若上面的路徑沒有作用，請改放這裡，或在 `/mcp` 介面查看實際讀取的檔案。
-- 官方文件沒有記載 `agy mcp add` 指令（部分第三方教學有提到），以直接編輯 JSON 最可靠。
-- 有使用者回報 agy 不會把外部環境變數傳給 MCP 伺服器；若要改埠號，請把 `"env": { "FLOW_QUEUE_PORT": "17345" }` 直接寫進設定。
-
-資料來源（2026-11 查證）：
-[Antigravity 官方 MCP 文件](https://antigravity.google/docs/mcp/)、
-[DEV Community：Configuring MCP Servers and Skills for Antigravity CLI and IDE](https://dev.to/gde/configuring-mcp-servers-and-skills-for-antigravity-cli-and-ide-2bh0)、
-[Medium：Where does Antigravity look for MCP Servers?](https://medium.com/google-cloud/where-does-antigravity-look-for-mcp-servers-ed3727b4686c)、
-[Arm Learning Paths：Antigravity CLI 安裝指南](https://learn.arm.com/install-guides/antigravity/)（舊路徑）。
-
-### 其他支援 MCP 的工具
-
-大多數工具（Claude Desktop、Cursor、Gemini CLI 等）都接受這種通用格式：
-
-```json
-{
-  "mcpServers": {
-    "flow-queue": { "command": "node", "args": ["G:/flow_extension/flow-queue-bridge/mcp.js"] }
-  }
-}
-```
-
----
-
-## 3. MCP 工具一覽
-
-| 工具 | 說明 |
+| 工具 | 說明（花費） |
 |---|---|
-| `flow_status` | 執行狀態、各狀態數量、已開啟的 Flow 分頁、橋接狀態 |
-| `flow_add_prompts` | 加入提示詞；每筆可附 `images`（本機路徑或公開的 http(s) 網址）、`characters`、`assets`；`start: true` 加入後立即開始 |
-| `flow_list_queue` / `flow_get_item` | 列出佇列 / 查看單筆（含錯誤與結果） |
-| `flow_start` / `flow_pause` / `flow_stop` | 開始、暫停、停止 |
-| `flow_retry` / `flow_remove` / `flow_clear` | 重試、刪除、清除已完成或失敗 |
-| `flow_settings` | 讀取或修改設定（`patch`） |
-| `flow_logs` | 最近的紀錄 |
-| `flow_list_assets` | 列出 Flow 專案中的素材／角色名稱 |
-| `flow_wait` | 等待佇列完成。**每次呼叫最多約 45 秒就回傳**；若結果為 `done: false` 請再呼叫一次 |
+| `flow_doctor` | 依序檢查 daemon → extension → flow_tab → queue；回傳 `{ok, checks:[{name, ok, code?, detail, fix, fix_en}]}`（免費） |
+| `flow_status` | 執行狀態、各狀態數量、Flow 分頁（免費） |
+| `flow_add_prompts` | 加入提示詞（尚未生成）；`request_id` 防重複、超過上限需 `confirm`；回傳 `{added, ids, request_id}` |
+| `flow_start` | 開始送出（**消耗點數**）；多個專案分頁時需 `tab_id`；回傳 `{tabId, title, url, projectId}` |
+| `flow_wait` | 等待指定 `ids` 完成，每次 ≤ 45 秒；回傳 `done`、`stalled`（paused／idle_not_started／cooldown／stopped）等 |
+| `flow_download` | 下載已完成項目，回傳絕對路徑（已下載過的會重用，`reused: true`） |
+| `flow_retry` | 重試（**再次消耗點數**）；預設只重試 failed，「未確認」需指定 ids 並 `confirm_unknown: true` |
+| `flow_list_queue`／`flow_get_item`／`flow_logs`／`flow_list_assets` | 查詢（免費） |
+| `flow_pause`／`flow_stop`／`flow_remove`／`flow_clear`／`flow_settings` | 控制與管理 |
 
-圖片限制：每張 ≤ 10 MB、必須是圖片格式；網址只接受 http(s)，且會阻擋指向本機、區網、link-local 等私有位址的網址（含轉址）。
-圖片會逐一上傳到擴充功能，再以參考的方式加入佇列。每次加入都附帶 `requestId`，重送時擴充功能不會重複加入。
+錯誤結果為 `isError: true`，並帶 `structuredContent: {code, error}`。
 
-範例指示（給 AI 代理）：「用 flow_add_prompts 把這 5 段提示詞加入 Flow Queue，每段都附上角色 Hero 和 D:/refs/castle.png，然後開始並等待完成，最後告訴我每段的結果。」
+## 指令列 flowq
 
----
+輸出到終端機時是文字，被管線／代理讀取時預設是 JSON；`--human`、`--json` 可強制。
+結束碼：`0` 成功、`1` 錯誤（JSON：`{ok:false, code, error}`）、`2` 用法錯誤（`invalid_argument`）。
 
-## 4. 指令列 `flowq`
-
-```powershell
-# 以下的 flowq 等同 node G:/flow_extension/flow-queue-bridge/cli.js（npm link 後可直接用 flowq）
-flowq pair                                  # 顯示配對碼
-flowq status
-flowq add "a red fox in the snow" "a cat on the moon" --start
-flowq add -f prompts.txt --split blank --character Hero --image D:/refs/a.png --top
-flowq list --status failed,unknown
-flowq get <id>
-flowq retry                                 # 重試全部失敗／未確認／已停止
-flowq remove <id> <id>
-flowq clear done
-flowq assets --category Characters --search hero
-flowq logs --limit 20
-flowq wait --timeout 3600                   # 等到沒有待處理／執行中的項目（逾時結束碼為 2）
-flowq settings maxConcurrent=2 autoDownload=true
+```
+flowq doctor [--no-start]                      flowq pair --copy
+flowq install-mcp [claude|codex|agy|all] [--dry-run]
+flowq agent-guide                              flowq status
+flowq add <prompt...> [-f file] [--split blank|line] [--image p] [--character n] [--asset n]
+          [--request-id id] [--confirm] [--top] [--start]
+flowq start [--tab id]     flowq pause     flowq stop
+flowq list [--status s[,s]] [--limit n] [--offset n]     flowq get <id>
+flowq retry [ids...] [--status s] [--confirm-unknown]    flowq remove <ids...>     flowq clear <done|failed|all>
+flowq wait <ids...> | --all [--timeout 秒]     （未完成時結束碼 1，code 為 timeout 或 stalled）
+flowq download <ids...> | --all-done [--no-wait]
+flowq assets [--category c] [--search s] [--tab id]     flowq logs [--limit n]     flowq settings [key=value...]
 ```
 
-任何指令加上 `--json` 會輸出原始 JSON。
+`flowq pair` 不加 `--copy` 只會在終端機顯示配對碼；輸出被管線讀取時會拒絕（避免配對碼進入代理紀錄）。
 
----
+## 錯誤代碼
 
-## 5. 多個 Chrome 設定檔共用一個橋接程式
-
-一台電腦只有一個常駐程式（同一個埠號），但你可能在好幾個 Chrome 設定檔都裝了 Flow Queue。
-**同一時間只有一個設定檔能使用橋接**，AI 代理的指令都會送到這個設定檔。
-
-- 每個設定檔第一次連線時會產生自己的識別碼（`instanceId`，存在擴充功能的本機儲存空間），之後一直沿用。
-- 先連上的設定檔會保留橋接；之後才連線的設定檔，側邊面板會顯示「**另一個 Chrome 設定檔正在使用橋接**」。
-  它不會一直搶連線，只會大約每 1 分鐘檢查一次；等原本的設定檔關閉（或停用橋接）後，就會**自動接手**。
-- 想立刻改用目前這個設定檔：在側邊面板按「**改用這個設定檔**」。原本的設定檔會顯示「**已被另一個 Chrome 設定檔接管**」，
-  而且**不會自動搶回來**，直到你在那個設定檔再按一次「改用這個設定檔」、修改它的橋接設定（啟用開關、埠號、配對碼），或重新啟動 Chrome。
-  重新啟動 Chrome 後它只會「排隊」：若另一個設定檔仍在使用，就顯示忙碌並等待，不會把對方踢掉。
-- 同一個設定檔的背景程式重新啟動時，會直接取代自己舊的連線；舊連線若已超過 45 秒沒有任何回應，也會被新的連線取代。
-- 若你複製過整個 Chrome 設定檔資料夾，兩個設定檔可能帶著相同的識別碼。被取代的那一個會自動換一個新的識別碼並改為等待，不會互相踢來踢去。
-- 「忙碌」與「已被接管」的通知都帶有用配對碼產生的簽章；沒有正確簽章的通知會被當成一般斷線處理（照常重試）。
-- `GET /api/health`（例如 `curl http://127.0.0.1:17345/api/health`）回傳的 `instance` 欄位是目前使用中設定檔識別碼的前 8 碼，可用來分辨是哪個設定檔。
-- 若希望兩個設定檔都能各自被 AI 操作，請為其中一個設定不同的埠號，並用 `FLOW_QUEUE_PORT` 另外啟動一個常駐程式。
-
-## 6. 安全設計
-
-- 只綁定 `127.0.0.1`；HTTP 要求必須帶 `Authorization: Bearer <token>`（`/api/health` 除外）。
-- 帶有 `Origin` 標頭的 HTTP 要求一律拒絕（擋掉網頁發出的要求）；`Host` 必須是 `127.0.0.1:<port>` 或 `localhost:<port>`（防 DNS rebinding）。
-- WebSocket `/ext` 只接受 Flow Queue 擴充功能的 Origin，連線後再以配對碼做雙向 HMAC 驗證：
-  常駐程式驗證擴充功能（失敗以 4001 關閉），擴充功能也驗證常駐程式，驗證完成前不執行任何要求。
-- HTTP 內容與 WebSocket 訊框上限 32 MB。
-
-## 7. 疑難排解
-
-| 狀況 | 處理方式 |
+| code | 意義 |
 |---|---|
-| 側邊面板顯示「尚未設定配對碼」 | 執行 `flowq pair`，貼上配對碼 |
-| 「橋接程式拒絕配對碼」或「驗證失敗（配對碼不符）」 | 配對碼與 `~/.flow-queue/token` 不一致，重新執行 `flowq pair` 並貼上 |
-| 「無法連線到橋接程式」 | 常駐程式沒在跑：執行 `flowq status`（會自動啟動）；或 `node server.js` 在前景執行查看訊息 |
-| MCP 回傳 `extension is not connected` | Chrome 沒開、擴充功能沒有啟用橋接，或尚未配對 |
-| 「另一個 Chrome 設定檔正在使用橋接」 | 另一個設定檔正在用橋接；按「改用這個設定檔」，或關掉另一個設定檔等它自動接手（見第 5 節） |
-| 「已被另一個 Chrome 設定檔接管」 | 別的設定檔按了「改用這個設定檔」；要用這個設定檔就再按一次 |
-| 埠號 17345 被占用 | 設定環境變數 `FLOW_QUEUE_PORT`，並在側邊面板把橋接埠號改成相同數字 |
+| `daemon_unreachable` | 連不到常駐程式（或它不接受目前的 token） |
+| `extension_not_connected` | 擴充功能沒有連上（Chrome 沒開、未啟用、未配對） |
+| `no_flow_tab` / `multiple_flow_tabs` | 沒有 Flow 專案分頁 / 有多個，需指定 tab_id |
+| `confirm_required` | 一次加入超過上限（預設 20），需使用者同意後帶 confirm |
+| `unknown_requires_confirm` | 「未確認」項目需使用者確認後才可重試 |
+| `not_found` / `invalid_argument` | 找不到項目 / 參數錯誤 |
+| `timeout` / `busy` / `extension_error` | 逾時 / 忙碌（冷卻等）/ 其他擴充功能錯誤 |
 
-常駐程式的紀錄檔：`~/.flow-queue/daemon.log`（由 MCP／flowq 自動啟動時）。
+## 多個 Chrome 設定檔
 
-## 8. 測試
+一台電腦一個常駐程式；**同一時間只有一個設定檔能使用橋接**。後連上的設定檔會顯示「另一個 Chrome 設定檔正在使用橋接」，
+約每分鐘檢查一次，原本的設定檔關閉後自動接手。在側邊面板按「改用這個設定檔」可立即接管；被接管的設定檔顯示「已被另一個 Chrome 設定檔接管」，
+不會自動搶回，直到再按一次、修改橋接設定或重新啟動 Chrome（重新啟動後只會排隊等待）。
+「忙碌／已被接管」通知都有配對碼簽章，複製過的設定檔資料夾（識別碼相同）會自動換新識別碼，不會互相踢來踢去。
+`GET /api/health` 的 `instance` 是目前使用中設定檔識別碼的前 8 碼。想讓兩個設定檔各自被操作，請用不同埠號另開一個常駐程式。
 
-```powershell
-node G:/flow_extension/flow-queue-bridge/test/smoke.js
-```
+## 安全設計
 
-測試會在暫存資料夾產生 token、用隨機埠啟動常駐程式，並以模擬的 chrome API 實際載入 `../flow-queue/bridge-client.js` 當作擴充功能，
-驗證健康檢查、401／403／503、雙向配對（錯誤配對碼 → 4001；常駐程式 welcome 驗證碼錯誤 → 擴充功能拒絕）、
-API 往返、CLI、完整的 MCP stdio 工作階段，以及多設定檔的情境（忙碌 4002、接管 4003、同一設定檔取代 4000、逾時連線被取代）。
+- 只綁定 `127.0.0.1`；`/api/call` 需 `Authorization: Bearer <token>`。
+- 拒絕帶 `Origin` 標頭的 HTTP 要求；`Host` 必須是 `127.0.0.1:<port>` 或 `localhost:<port>`（防 DNS rebinding）。
+- WebSocket 只接受擴充功能的 Origin，並以配對碼做雙向 HMAC 驗證（錯誤 → 4001）；驗證前不執行任何要求。
+- 圖片每張 ≤ 10 MB；網址只接受公開的 http(s)，阻擋本機／區網／link-local（含轉址與 DNS 解析結果）。HTTP 內容與 WebSocket 訊框上限 32 MB。
+
+## 疑難排解
+
+先執行 `flowq doctor --human`，照每個失敗項目的提示處理。常駐程式紀錄：`~/.flow-queue/daemon.log`。
+埠號 17345 被占用時，設定 `FLOW_QUEUE_PORT` 並在側邊面板把「橋接埠」改成相同數字。
+
+## 測試
+
+`node G:/flow_extension/flow-queue-bridge/test/smoke.js` — 使用暫存的 HOME、隨機埠、模擬的 chrome API（實際載入 `../flow-queue/bridge-client.js`）
+與假的 `claude` 指令，不會碰到你真正的設定檔；涵蓋 HTTP 安全檢查、配對、多設定檔、MCP 工作階段、CLI 與 install-mcp。

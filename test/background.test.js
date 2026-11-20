@@ -11,7 +11,7 @@ const chrome = {
   scripting: { executeScript: async () => {} },
   debugger: { onDetach: ev('detach'), attach: async () => {}, detach: async () => {}, sendCommand: async () => {} },
   alarms: { create: () => {}, clear: async () => {}, onAlarm: ev('alarm') },
-  downloads: { download: async (o) => { downloads.push(o); return 1; } },
+  downloads: { download: async (o) => { downloads.push(o); return downloads.length; }, search: async ({ id }) => [{ id, state: 'complete', filename: 'C:\\Users\\u\\Downloads\\' + downloads[id - 1].filename.replace(/\//g, '\\') }] },
 };
 chrome.storage.session = { _d: {}, get: async (k) => ({ [k]: chrome.storage.session._d[k] }), set: async (o) => Object.assign(chrome.storage.session._d, o) };
 chrome.storage.local.remove = async (keys) => { for (const k of [].concat(keys)) delete store[k]; };
@@ -121,6 +121,44 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   ctx.FQBridge = { reconnect: async (o) => { took = o; } };
   r = await new Promise((res) => listeners.msg[0]({ type: 'BRIDGE_TAKEOVER' }, { id: 'ext' }, res));
   assert(r.ok && took && took.takeover === true, 'BRIDGE_TAKEOVER calls FQBridge.reconnect({takeover:true})');
+  // ---- v1.3: FQ download ----
+  store.queue.push({ id: 'two', seq: 7, prompt: 'two pics', status: 'done', results: [{ src: 'https://flow-content.google/a.jpg', isVideo: false }, { src: 'https://flow-content.google/b.jpg', isVideo: false }] });
+  store.queue.push({ id: 'notyet', seq: 8, prompt: 'p', status: 'pending', results: [] });
+  const dl = await ctx.FQ.call('download', { ids: ['two', 'notyet', 'ghost'] });
+  assert(dl.files.length === 2 && dl.files.every((f) => f.state === 'complete' && /^C:\\/.test(f.path)) && dl.files[1].filename.endsWith('0007_two pics_2.jpg'), 'FQ download returns absolute paths for each result');
+  assert(dl.errors.length === 2 && dl.errors.some((e) => e.id === 'notyet') && dl.errors.some((e) => e.id === 'ghost'), 'FQ download reports not-done and missing items');
+  let threw = false; try { await ctx.FQ.call('download', {}); } catch (e) { threw = true; }
+  assert(threw, 'FQ download requires ids or allDone');
+  // ---- v1.3: agent safety guards ----
+  const dl2 = await ctx.FQ.call('download', { ids: ['two'] });
+  const before2 = downloads.length;
+  assert(dl2.files.length === 2 && dl2.files.every((f) => f.reused === true) && downloads.length === before2, 'second download reuses existing files');
+  const many = Array.from({ length: 25 }, (_, i) => 'batch ' + i);
+  let err = null; try { await ctx.FQ.call('add', { prompts: many }); } catch (e) { err = e; }
+  assert(err && err.code === 'confirm_required', 'large batch needs confirm');
+  const okBatch = await ctx.FQ.call('add', { prompts: many, confirm: true });
+  assert(okBatch.added === 25, 'large batch with confirm is added');
+  store.queue.push({ id: 'unk', seq: 50, prompt: 'u', status: 'unknown', results: [] });
+  err = null; try { await ctx.FQ.call('retry', { ids: ['unk'] }); } catch (e) { err = e; }
+  assert(err && err.code === 'unknown_requires_confirm', 'retrying unknown needs confirm_unknown');
+  await ctx.FQ.call('retry', {});
+  assert(store.queue.find((x) => x.id === 'unk').status === 'unknown', 'default retry leaves unknown alone');
+  await ctx.FQ.call('retry', { ids: ['unk'], confirmUnknown: true });
+  assert(store.queue.find((x) => x.id === 'unk').status === 'pending', 'unknown retried with confirmation');
+  const realQuery = chrome.tabs.query;
+  chrome.tabs.query = async () => [{ id: 7, url: 'https://flow.google.com/project/abc', title: 'A' }, { id: 9, url: 'https://flow.google.com/project/xyz', title: 'B' }];
+  await chrome.storage.local.set({ run: { state: 'idle', tabId: null } });
+  err = null; try { await ctx.FQ.call('start', {}); } catch (e) { err = e; }
+  assert(err && err.code === 'multiple_flow_tabs' && /xyz/.test(err.message), 'start with several Flow tabs asks which one');
+  const st2 = await ctx.FQ.call('start', { tabId: 7 });
+  assert(st2.tabId === 7 && st2.projectId === 'abc' && st2.title === 'Flow', 'start returns tab/project info');
+  await ctx.FQ.call('stop', {});
+  chrome.tabs.query = async () => [];
+  err = null; try { await ctx.FQ.call('start', {}); } catch (e) { err = e; }
+  assert(err && err.code === 'no_flow_tab', 'start without Flow tab -> no_flow_tab');
+  chrome.tabs.query = realQuery;
+  err = null; try { await ctx.FQ.call('settings', { patch: { agentBatchLimit: 999 } }); } catch (e) { err = e; }
+  assert(store.settings.agentBatchLimit === 20, 'agents cannot raise their own batch limit');
   await listeners.startup[0]();
   assert(store.run.state === 'idle' && store.run.tabId === null, 'startup resets run');
 })();

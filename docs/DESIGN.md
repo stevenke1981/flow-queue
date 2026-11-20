@@ -133,3 +133,16 @@ Problem: each profile's bridge-client connected and the daemon replaced the old 
 Flow sometimes renders results with page-scoped `blob:` URLs, which the service worker cannot download and which die on reload.
 - content.js stores `results[].mediaId` and prefers a durable URL (img/video/source/a attributes containing `getMediaUrlRedirect` or `flow-content.google`) over `blob:`.
 - DOWNLOAD with a `blob:` url (or `fetchViaTab: true`) is routed by the background to the Flow tab: content message `FETCH_MEDIA {src, mediaId}` → `{ok, dataUrl, mime, ext}`; the content script first fetches the stored blob URL, and if that fails, finds the tile by mediaId in the current page and fetches its current source. Cap 40 MB. Background then downloads the data URL.
+
+## 10. Agent-first operation (v1.3)
+
+Agents (Claude Code, Codex, agy) are the primary operators; the side panel is the human fallback.
+
+- **Single source of operating rules**: `flow-queue-bridge/agent-instructions.md` (written by the lead). mcp.js reads it at startup and returns it as `instructions` in the `initialize` result; AGENTS.md links to it.
+- **FQ.call('download', {ids?: string[], allDone?: boolean, wait?: boolean=true})** (background, lead): downloads every result of the given done items through the DOWNLOAD path (blob-safe) and returns
+  `{files: [{id, seq, index, filename, path?, state}], errors: [{id, error}]}`. With `wait`, it waits (≤ 60 s total) for chrome.downloads to complete and returns absolute `path`s.
+- **MCP tools** (bridge worker): add `flow_doctor` and `flow_download`. Tool descriptions must state side effects and cost ("spends Flow credits", "does not resubmit 'unknown' items").
+- **flow_doctor / flowq doctor**: ordered checks `daemon` → `extension` (connected, holder instance) → `flow_tab` (a Flow /project/ tab is open) → `queue` (run state, counts, cooldown). Returns `{ok, checks:[{name, ok, detail, fix}]}`; `fix` is a short Traditional-Chinese instruction the agent can relay to the user verbatim.
+- **Stable error codes** in MCP error results (`structuredContent.code` + text) and CLI JSON errors: `daemon_unreachable`, `extension_not_connected`, `no_flow_tab`, `not_found`, `invalid_argument`, `timeout`, `busy`, `extension_error`.
+- **CLI**: JSON on stdout by default when stdout is not a TTY (`--human` forces text, `--json` forces JSON); errors in JSON mode are `{ok:false, code, error}` with exit code 1 (2 for usage errors).
+- **flowq install-mcp [claude|codex|agy|all] [--dry-run]**: idempotent registration of the MCP server using absolute paths; backs up any config file it edits (`<file>.bak-<timestamp>`); claude via `claude mcp add --scope user` when the CLI exists; codex via ~/.codex/config.toml; agy via the verified Antigravity mcp_config.json path. Prints what it changed.

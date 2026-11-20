@@ -168,30 +168,34 @@ let extInfo = null;    // hello payload
 let seq = 0;
 const pending = new Map(); // id -> {resolve, timer, conn}
 
+// per-method timeouts for one /api/call round trip (DESIGN §5, §10)
+const CALL_TIMEOUT_MS = { listAssets: 60000, download: 90000 };
+const CODE_RE = /^[a-z][a-z0-9_]{0,39}$/;
+
 function rejectPendingFor(conn, why) {
   for (const [id, p] of pending) {
     if (p.conn !== conn) continue;
     clearTimeout(p.timer);
     pending.delete(id);
-    p.resolve({ status: 503, body: { ok: false, error: why } });
+    p.resolve({ status: 503, body: { ok: false, code: 'extension_not_connected', error: why } });
   }
 }
 
 function callExtension(method, params) {
   return new Promise((resolve) => {
-    if (!ext) return resolve({ status: 503, body: { ok: false, error: 'Flow Queue extension is not connected' } });
+    if (!ext) return resolve({ status: 503, body: { ok: false, code: 'extension_not_connected', error: 'Flow Queue extension is not connected' } });
     const id = String(++seq);
-    const ms = method === 'listAssets' ? 60000 : 30000;
+    const ms = CALL_TIMEOUT_MS[method] || 30000;
     const conn = ext;
     const timer = setTimeout(() => {
       pending.delete(id);
-      resolve({ status: 504, body: { ok: false, error: 'extension did not answer "' + method + '" within ' + ms / 1000 + ' s' } });
+      resolve({ status: 504, body: { ok: false, code: 'timeout', error: 'extension did not answer "' + method + '" within ' + ms / 1000 + ' s' } });
     }, ms);
     pending.set(id, { resolve, timer, conn });
     if (!conn.sendJson({ type: 'req', id, method, params: params == null ? {} : params })) {
       clearTimeout(timer);
       pending.delete(id);
-      resolve({ status: 503, body: { ok: false, error: 'Flow Queue extension is not connected' } });
+      resolve({ status: 503, body: { ok: false, code: 'extension_not_connected', error: 'Flow Queue extension is not connected' } });
     }
   });
 }
@@ -260,7 +264,7 @@ function onExtMessage(conn, msg) {
     pending.delete(String(msg.id));
     p.resolve(msg.ok
       ? { status: 200, body: { ok: true, result: msg.result === undefined ? null : msg.result } }
-      : { status: 200, body: { ok: false, error: String(msg.error || 'extension call failed') } });
+      : { status: 200, body: { ok: false, error: String(msg.error || 'extension call failed'), ...(typeof msg.code === 'string' && CODE_RE.test(msg.code) ? { code: msg.code } : {}) } });
   } else if (msg.type === 'ping') {
     conn.sendJson({ type: 'pong' });
   } // 'pong' only refreshes lastSeen
@@ -332,10 +336,10 @@ const server = http.createServer(async (req, res) => {
       try {
         body = JSON.parse(await readBody(req));
       } catch (e) {
-        return send(res, e.status || 400, { ok: false, error: e.status ? e.message : 'body must be JSON {method, params}' });
+        return send(res, e.status || 400, { ok: false, code: 'invalid_argument', error: e.status ? e.message : 'body must be JSON {method, params}' });
       }
-      if (!body || typeof body.method !== 'string' || !body.method) return send(res, 400, { ok: false, error: 'missing "method"' });
-      if (!ext) return send(res, 503, { ok: false, error: 'Flow Queue extension is not connected (open Chrome, enable the AI bridge in the side panel and paste the token from "flowq pair")' });
+      if (!body || typeof body.method !== 'string' || !body.method) return send(res, 400, { ok: false, code: 'invalid_argument', error: 'missing "method"' });
+      if (!ext) return send(res, 503, { ok: false, code: 'extension_not_connected', error: 'Flow Queue extension is not connected (open Chrome, enable the AI bridge in the side panel and paste the token from "flowq pair")' });
       const r = await callExtension(body.method, body.params);
       return send(res, r.status, r.body);
     }

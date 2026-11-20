@@ -25,8 +25,10 @@ const DEFAULT_SETTINGS = Object.freeze({
   clearIngredients: true, // 有素材的項目先清空 Flow 提示詞框上的既有素材
   bridgeEnabled: false,  // 允許本機 AI 代理（Claude / Codex / agy）透過橋接控制（需配對碼）
   bridgePort: 17345,
-  bridgeToken: ''        // 與 ~/.flow-queue/token 相同的配對碼，用來雙向驗證橋接程式
+  bridgeToken: '',       // 與 ~/.flow-queue/token 相同的配對碼，用來雙向驗證橋接程式
+  agentBatchLimit: 20    // AI 代理一次加入超過這個數量時，必須帶 confirm（先問過使用者）
 });
+const codedError = (code, message) => Object.assign(new Error(message), { code });
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 function sniffImage(bytes) {
@@ -370,6 +372,7 @@ const handlers = {
     s.clearIngredients = s.clearIngredients !== false;
     s.bridgeEnabled = !!s.bridgeEnabled;
     s.bridgePort = Math.round(num(s.bridgePort, 1024, 65535, 17345));
+    s.agentBatchLimit = Math.round(num(s.agentBatchLimit, 1, 1000, 20));
     s.bridgeToken = /^[0-9a-f]{64}$/i.test(String(s.bridgeToken || '').trim()) ? String(s.bridgeToken).trim().toLowerCase() : '';
     d.settings = s;
     return { settings: s };
@@ -692,7 +695,7 @@ const callHandler = async (type, msg = {}) => unwrap(await handlers[type]({ type
   .then((r) => ({ ok: true, ...(r || {}) }), (e) => ({ ok: false, error: String((e && e.message) || e) })));
 // 配對碼不能透過橋接回傳給 AI 代理，也不能被代理修改
 const publicSettings = (s) => { const { bridgeToken, ...rest } = s || {}; return { ...rest, bridgePaired: !!bridgeToken }; };
-const BRIDGE_LOCKED_KEYS = new Set(['bridgeEnabled', 'bridgePort', 'bridgeToken']);
+const BRIDGE_LOCKED_KEYS = new Set(['bridgeEnabled', 'bridgePort', 'bridgeToken', 'agentBatchLimit']);
 const stripItem = (it) => ({ ...it, results: (it.results || []).map((r) => ({ src: r.src, isVideo: r.isVideo })) });
 
 const recentAdds = new Map(); // requestId -> {at, result}：避免代理重試造成重複加入
@@ -719,7 +722,7 @@ globalThis.FQ = {
       case 'get': {
         const { queue = [] } = await chrome.storage.local.get('queue');
         const it = queue.find((x) => x.id === params.id);
-        if (!it) throw new Error('找不到項目：' + params.id);
+        if (!it) throw codedError('not_found', '找不到項目：' + params.id);
         return { item: stripItem(it) };
       }
       case 'uploadFile': return callHandler('ADD_FILE', params);
@@ -731,6 +734,12 @@ globalThis.FQ = {
         if (rid) {
           const persisted = (await chrome.storage.session.get('recentAdds')).recentAdds || {};
           if (persisted[rid] && Date.now() - persisted[rid].at < 600000) return { ...persisted[rid].result, deduped: true };
+        }
+        const count = Array.isArray(params.prompts) ? params.prompts.length : 0;
+        if (!count) throw codedError('invalid_argument', 'prompts 是空的');
+        const { agentBatchLimit } = withDefaults(await chrome.storage.local.get(['settings'])).settings;
+        if (count > agentBatchLimit && params.confirm !== true) {
+          throw codedError('confirm_required', '一次加入 ' + count + ' 筆，超過上限 ' + agentBatchLimit + ' 筆；每筆都會消耗 Flow 點數。請先向使用者確認，再以 confirm: true 重送（沿用同一個 request_id）。');
         }
         const refs = Array.isArray(params.refs) ? [...params.refs] : [];
         for (const f of Array.isArray(params.files) ? params.files : []) {
@@ -756,15 +765,40 @@ globalThis.FQ = {
         }
       }
       case 'start': {
-        const tabId = params.tabId != null ? Number(params.tabId) : await pickFlowTab();
-        if (tabId == null) throw new Error('沒有開啟的 Google Flow 專案分頁');
+        let tabId = params.tabId != null ? Number(params.tabId) : null;
+        if (tabId == null) {
+          const { run } = await chrome.storage.local.get('run');
+          const tabs = (await chrome.tabs.query({})).filter((t) => FLOW_URL_RE.test(t.url || '') && /\/project\//.test(t.url || ''));
+          const keep = run && run.tabId != null && tabs.find((t) => t.id === run.tabId);
+          if (keep) tabId = keep.id;
+          else if (tabs.length === 1) tabId = tabs[0].id;
+          else if (!tabs.length) throw codedError('no_flow_tab', '沒有開啟的 Google Flow 專案分頁，請使用者先開啟一個 Flow 專案');
+          else {
+            throw codedError('multiple_flow_tabs', '開著 ' + tabs.length + ' 個 Flow 專案分頁，請問使用者要用哪一個，再以 tab_id 指定：' +
+              tabs.map((t) => t.id + '「' + (t.title || '') + '」' + projectOf(t.url)).join('；'));
+          }
+        }
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tab) throw codedError('not_found', '找不到分頁 ' + tabId);
         await callHandler('START', { tabId });
-        return { tabId };
+        return { tabId, title: tab.title || '', url: tab.url || '', projectId: projectOf(tab.url) };
       }
       case 'pause': return callHandler('PAUSE');
       case 'stop': return callHandler('STOP', { reason: params.reason });
       // 預設不重試「未確認」：那些可能已經在 Flow 生成過，重送會重複扣點數
-      case 'retry': return callHandler('RETRY_ITEMS', { ids: params.ids, statuses: params.statuses || ['failed', 'stopped'] });
+      case 'retry': {
+        const ids = Array.isArray(params.ids) ? params.ids : [];
+        if (ids.length) {
+          const { queue = [] } = await chrome.storage.local.get('queue');
+          const unknown = queue.filter((x) => ids.includes(x.id) && x.status === 'unknown');
+          if (unknown.length && params.confirmUnknown !== true) {
+            throw codedError('unknown_requires_confirm', unknown.length + ' 筆是「未確認」狀態，可能已經生成並扣過點數。請先請使用者到 Flow 確認，同意後再以 confirm_unknown: true 重試。');
+          }
+          return callHandler('RETRY_ITEMS', { ids });
+        }
+        const statuses = (params.statuses || ['failed']).filter((s) => s !== 'unknown' || params.confirmUnknown === true);
+        return callHandler('RETRY_ITEMS', { statuses });
+      }
       case 'remove': return callHandler('REMOVE_ITEMS', { ids: params.ids || [] });
       case 'clear': return callHandler('CLEAR', { mode: params.mode || 'done' });
       case 'move': return callHandler('MOVE_ITEM', params);
@@ -779,7 +813,73 @@ globalThis.FQ = {
         return { logs: logs.slice(-Math.min(300, Math.max(1, Number(params.limit) || 50))) };
       }
       case 'listAssets': return callHandler('LIST_ASSETS', params);
-      default: throw new Error('未知的方法：' + method);
+      // 下載已完成項目的結果；等待 Chrome 下載完成並回傳硬碟上的完整路徑，讓代理可以直接使用檔案
+      case 'download': {
+        const { queue = [] } = await chrome.storage.local.get('queue');
+        let items;
+        if (Array.isArray(params.ids) && params.ids.length) {
+          items = params.ids.slice(0, 200).map((id) => queue.find((x) => x.id === id) || { id, missing: true });
+        } else if (params.allDone) {
+          items = queue.filter((x) => x.status === 'done' && (x.results || []).length).slice(0, 200);
+        } else {
+          throw codedError('invalid_argument', '請指定 ids，或設定 allDone: true');
+        }
+        const files = [], errors = [];
+        for (const it of items) {
+          if (it.missing) { errors.push({ id: it.id, error: '找不到項目' }); continue; }
+          const results = it.results || [];
+          if (it.status !== 'done' || !results.length) {
+            errors.push({ id: it.id, error: it.status !== 'done' ? '項目尚未完成（狀態：' + it.status + '）' : '這個項目沒有結果' });
+            continue;
+          }
+          for (let k = 0; k < results.length; k++) {
+            const res = results[k];
+            const prevId = it.downloads && it.downloads[k + 1];
+            if (prevId) {
+              const [prev] = await chrome.downloads.search({ id: prevId });
+              if (prev && prev.state === 'complete' && prev.exists !== false) {
+                files.push({ id: it.id, seq: it.seq, index: k + 1, downloadId: prevId, filename: prev.filename, path: prev.filename, state: 'complete', reused: true });
+                continue;
+              }
+            }
+            const name = String(it.seq).padStart(4, '0') + '_' + String(it.prompt || '').slice(0, 40) + (results.length > 1 ? '_' + (k + 1) : '');
+            try {
+              const r = await callHandler('DOWNLOAD', { url: res.src, name, ext: res.isVideo ? 'mp4' : 'jpg', mediaId: res.mediaId });
+              files.push({ id: it.id, seq: it.seq, index: k + 1, downloadId: r.downloadId, filename: r.filename, state: 'in_progress' });
+            } catch (e) {
+              errors.push({ id: it.id, index: k + 1, error: String((e && e.message) || e) });
+            }
+          }
+        }
+        // 記下每個結果的下載 id，下次直接回傳既有檔案，不會產生「(1)」重複檔
+        const fresh = files.filter((f) => !f.reused);
+        if (fresh.length) {
+          await mutate((d) => {
+            for (const f of fresh) {
+              const it = findItem(d, f.id);
+              if (it) it.downloads = { ...(it.downloads || {}), [f.index]: f.downloadId };
+            }
+          });
+        }
+        if (params.wait !== false && files.length) {
+          const deadline = Date.now() + 60000;
+          for (;;) {
+            let pending = 0;
+            for (const f of files) {
+              if (f.state !== 'in_progress') continue;
+              const [dl] = await chrome.downloads.search({ id: f.downloadId });
+              if (!dl) { f.state = 'missing'; continue; }
+              if (dl.state === 'complete') { f.state = 'complete'; f.path = dl.filename; }
+              else if (dl.state === 'interrupted') { f.state = 'interrupted'; f.error = dl.error || '下載中斷'; }
+              else pending++;
+            }
+            if (!pending || Date.now() > deadline) break;
+            await new Promise((r) => setTimeout(r, 500));
+          }
+        }
+        return { files, errors };
+      }
+      default: throw codedError('invalid_argument', '未知的方法：' + method);
     }
   }
 };
