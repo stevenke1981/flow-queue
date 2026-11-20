@@ -12,6 +12,7 @@ const TOKEN = lib.ensureToken();
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const PING_MS = 20000;
 const DEAD_MS = 65000;          // no frame from the extension for this long → drop it
+const STALE_MS = Math.max(100, parseInt(process.env.FLOW_QUEUE_STALE_MS || '', 10) || 45000); // DESIGN §8 (env override for tests)
 const AUTH_MS = 10000;          // the extension must answer the challenge within this time
 const MAX_MESSAGE = lib.MAX_BODY_BYTES;   // 32 MB (DESIGN §7)
 const MAX_BODY = lib.MAX_BODY_BYTES;
@@ -195,6 +196,8 @@ function callExtension(method, params) {
   });
 }
 
+const short = (id) => (id ? String(id).slice(0, 8) : null);
+
 function macOk(expectedHex, gotHex) {
   const a = Buffer.from(String(expectedHex), 'utf8');
   const b = Buffer.from(typeof gotHex === 'string' ? gotHex.toLowerCase() : '', 'utf8');
@@ -202,7 +205,11 @@ function macOk(expectedHex, gotHex) {
 }
 
 // Mutual authentication (DESIGN §7): challenge → hello{mac} → welcome{mac}. Only an authenticated
-// connection becomes the extension link; a new authenticated connection replaces the old one.
+// connection becomes the extension link. When one already exists (DESIGN §8, several Chrome profiles):
+// same instanceId or stale existing socket → replace (4000); takeover:true → replace (old gets 4003);
+// otherwise the newcomer is rejected with 4002 'busy' and the existing link is left untouched.
+// 4002/4003 are preceded by {type:'busy'|'taken', mac: HMAC(token, kind + ':' + extNonce)} so the extension can tell
+// that the close really comes from a daemon holding the pairing token.
 function onExtMessage(conn, msg) {
   if (!msg || typeof msg !== 'object') return;
   if (!conn.authed) {
@@ -215,17 +222,35 @@ function onExtMessage(conn, msg) {
       return;
     }
     clearTimeout(conn.authTimer);
-    conn.authed = true;
-    conn.sendJson({ type: 'welcome', mac: lib.hmacHex(TOKEN, 'daemon:' + extNonce) });
+    const instanceId = typeof msg.instanceId === 'string' ? msg.instanceId.slice(0, 100) : '';
+    let replaceCode = 0;
     if (ext && ext !== conn) {
+      const idle = Date.now() - ext.lastSeen;
+      if (instanceId && ext.instanceId === instanceId) replaceCode = 4000;      // same profile, SW restart
+      else if (idle > STALE_MS) replaceCode = 4000;                            // old socket is dead
+      else if (msg.takeover === true) replaceCode = 4003;                      // user-initiated takeover
+      else {
+        log('rejected extension instance ' + short(instanceId) + ': bridge busy (held by ' + short(ext.instanceId) + ')');
+        conn.sendJson({ type: 'busy', mac: lib.hmacHex(TOKEN, 'busy:' + extNonce) }); // signed, so the ext trusts it
+        conn.close(4002, 'busy');
+        return;
+      }
+    }
+    conn.authed = true;
+    conn.instanceId = instanceId;
+    conn.extNonce = extNonce;
+    conn.sendJson({ type: 'welcome', mac: lib.hmacHex(TOKEN, 'daemon:' + extNonce) });
+    if (replaceCode) {
       const old = ext;
       ext = conn;
-      rejectPendingFor(old, 'Flow Queue extension connection was replaced');
-      old.close(4000, 'replaced by a new connection');
+      rejectPendingFor(old, replaceCode === 4003 ? 'Flow Queue extension connection was taken over' : 'Flow Queue extension connection was replaced');
+      if (replaceCode === 4003) old.sendJson({ type: 'taken', mac: lib.hmacHex(TOKEN, 'taken:' + old.extNonce) });
+      old.close(replaceCode, replaceCode === 4003 ? 'taken over' : 'replaced');
+      log('instance ' + short(old.instanceId) + ' ' + (replaceCode === 4003 ? 'taken over' : 'replaced') + ' by ' + short(instanceId));
     }
     ext = conn;
-    extInfo = { version: msg.version, extensionId: msg.extensionId };
-    log('extension authenticated', JSON.stringify(extInfo));
+    extInfo = { version: msg.version, extensionId: msg.extensionId, instanceId };
+    log('extension authenticated', JSON.stringify({ version: msg.version, extensionId: msg.extensionId, instance: short(instanceId) }));
     return;
   }
   if (msg.type === 'res') {
@@ -297,7 +322,7 @@ const server = http.createServer(async (req, res) => {
 
     if (url === '/api/health') {
       if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { ok: false, error: 'method not allowed' });
-      return send(res, 200, { ok: true, extensionConnected: !!ext, version: lib.VERSION });
+      return send(res, 200, { ok: true, extensionConnected: !!ext, version: lib.VERSION, instance: ext ? short(ext.instanceId) : null });
     }
 
     if (url === '/api/call') {

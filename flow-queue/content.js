@@ -103,15 +103,55 @@
   const pendingTiles = () => [...document.querySelectorAll('flow-pending-tile')];
   const errorTiles = () => [...document.querySelectorAll('flow-error-tile')];
 
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  // 只認主機或路徑本身：flow-content.google 網域，或 Flow 的 media.getMediaUrlRedirect 端點
+  const DURABLE_RE = /^https:\/\/(?:flow-content\.google\/|(?:[a-z0-9-]+\.)*(?:flow\.google(?:\.com)?|labs\.google)\/[^?#\s]*getMediaUrlRedirect)/i;
+
+  // Flow 有時用 blob: 網址顯示結果（只在這一頁有效、重新整理就失效）；盡量找出可長期使用的網址
+  function durableSource(root, isVideo, mediaId) {
+    const attrs = [];
+    const push = (v) => { if (v && typeof v === 'string') attrs.push(v); };
+    if (isVideo) {
+      root.querySelectorAll('video, video source').forEach((v) => { push(v.currentSrc); push(v.getAttribute('src')); push(v.getAttribute('data-src')); });
+    } else {
+      root.querySelectorAll('img').forEach((i) => { push(i.currentSrc); push(i.getAttribute('src')); push(i.getAttribute('data-src')); });
+    }
+    root.querySelectorAll('a[href]').forEach((a) => push(a.href));
+    const durable = attrs.find((u) => DURABLE_RE.test(u) && (!isVideo || !/thumbnail|image/i.test(u) || /video/i.test(u)));
+    if (durable) return durable;
+    if (isVideo && mediaId) {
+      // 影片可能經由 MediaSource 播放：從已載入的影片資源中找含有同一個 media id 的網址（排除縮圖）
+      const hit = performance.getEntriesByType('resource')
+        .filter((e) => /^(video|fetch|xmlhttprequest|other)$/.test(e.initiatorType || ''))
+        .map((e) => e.name).reverse()
+        .find((n) => DURABLE_RE.test(n) && n.includes(mediaId) && !/thumbnail|image|poster/i.test(n));
+      if (hit) return hit;
+    }
+    return '';
+  }
+
   function mediaOf(root) {
     const video = root.querySelector('video');
     const img = root.querySelector('img[data-media-id]') || root.querySelector('img');
     const isVideo = !!root.querySelector('flow-video-tile') || !!video;
-    const src = (isVideo && video && (video.currentSrc || video.src)) ||
+    const rawSrc = (isVideo && video && (video.currentSrc || video.src)) ||
       (img && (img.currentSrc || img.src)) || '';
-    const mediaId = (img && img.getAttribute('data-media-id')) || '';
+    // 不從 blob: 網址取 UUID（那是 blob 自己的 id）；優先 data-media-id、?name=、/edit/<id>
+    const idMatch = (s) => {
+      s = String(s || '');
+      if (!s || /^blob:/i.test(s)) return '';
+      const named = s.match(/[?&]name=([0-9a-f-]{36})/i);
+      if (named) return named[1].toLowerCase();
+      const m = s.match(UUID_RE);
+      return m ? m[0].toLowerCase() : '';
+    };
+    const editLink = root.querySelector('a[href*="/edit/"]');
+    const editId = editLink ? ((editLink.getAttribute('href') || '').match(/\/edit\/([0-9a-f-]{36})/i) || [])[1] || '' : '';
+    const mediaId = String((img && img.getAttribute('data-media-id')) || idMatch(img && img.getAttribute('src')) ||
+      idMatch(video && video.getAttribute('src')) || editId || '').toLowerCase();
+    const src = /^blob:/i.test(rawSrc) ? (durableSource(root, isVideo, mediaId) || rawSrc) : rawSrc;
     const loaded = isVideo ? !!src : !!(img && img.complete && img.naturalWidth > 0);
-    return { src, isVideo, loaded, id: mediaId || src.split('?')[0] || src };
+    return { src, isVideo, loaded, mediaId, id: mediaId || src.split('?')[0] || src };
   }
 
   function mediaTiles() {
@@ -796,23 +836,48 @@
     return String(s || '').replace(/[\u0000-\u001f<>:"/\\|?*]+/g, ' ').replace(/\s+/g, '_').slice(0, 40);
   }
 
-  const EXT_BY_TYPE = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif', 'video/mp4': 'mp4', 'video/webm': 'webm' };
-  async function toDownloadable(src, isVideo) {
-    const fallbackExt = isVideo ? 'mp4' : 'jpg';
-    if (!/^blob:/i.test(src)) return { url: src, ext: fallbackExt };
-    const blob = await (await fetch(src)).blob();
-    if (blob.size > 40 * 1024 * 1024) throw new Error('檔案太大（' + Math.round(blob.size / 1048576) + ' MB），請在 Flow 手動下載');
-    const url = await new Promise((resolve, reject) => {
+  const EXT_BY_TYPE = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif', 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov' };
+  const MAX_FETCH_BYTES = 25 * 1024 * 1024; // 轉成 base64 後約 33 MB，留在擴充功能訊息上限內
+
+  async function blobToDataUrl(src) {
+    const res = await fetch(src);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    if (!blob.size) throw new Error('空的檔案');
+    if (blob.size > MAX_FETCH_BYTES) throw new Error('檔案太大（' + Math.round(blob.size / 1048576) + ' MB），請在 Flow 手動下載');
+    const dataUrl = await new Promise((resolve, reject) => {
       const fr = new FileReader();
       fr.onload = () => resolve(fr.result);
       fr.onerror = () => reject(fr.error);
       fr.readAsDataURL(blob);
     });
-    return { url, ext: EXT_BY_TYPE[blob.type] || fallbackExt };
+    return { dataUrl, mime: blob.type, ext: EXT_BY_TYPE[blob.type] || '' };
+  }
+
+  // 取得可下載的內容：先試存下的 blob 網址；失效時依 mediaId 在目前頁面找回該結果
+  async function fetchMedia({ src = '', mediaId = '', isVideo = false } = {}) {
+    const fallbackExt = isVideo ? 'mp4' : 'jpg';
+    const errors = [];
+    if (/^blob:/i.test(src)) {
+      try { const r = await blobToDataUrl(src); return { ...r, ext: r.ext || fallbackExt }; } catch (e) { errors.push('暫存網址已失效'); }
+    } else if (src) {
+      return { url: src, ext: fallbackExt };
+    }
+    const id = String(mediaId || '').toLowerCase();
+    if (id) {
+      const m = mediaTiles().find((t) => t.mediaId && t.mediaId.toLowerCase() === id);
+      if (m) {
+        if (!/^blob:/i.test(m.src)) return { url: m.src, ext: m.isVideo ? 'mp4' : 'jpg' };
+        try { const r = await blobToDataUrl(m.src); return { ...r, ext: r.ext || (m.isVideo ? 'mp4' : 'jpg') }; } catch (e) { errors.push(String(e.message || e)); }
+      } else {
+        errors.push('目前頁面找不到這個結果（請捲動到該結果或打開它所在的專案）');
+      }
+    }
+    throw new Error('無法取得檔案：' + (errors.join('；') || '沒有可用的網址'));
   }
 
   async function completeItem(rec, media, settings) {
-    const results = media.map((m) => ({ src: m.src.slice(0, 4000), isVideo: m.isVideo }));
+    const results = media.map((m) => ({ src: m.src.slice(0, 4000), isVideo: m.isVideo, mediaId: m.mediaId || '', projectId: projectId() }));
     await send({
       type: 'UPDATE_ITEM',
       id: rec.id,
@@ -825,9 +890,9 @@
     for (let k = 0; k < media.length; k++) {
       const m = media[k];
       try {
-        const { url, ext } = await toDownloadable(m.src, m.isVideo);
+        const got = await fetchMedia({ src: m.src, mediaId: m.mediaId, isVideo: m.isVideo });
         const name = String(rec.seq).padStart(3, '0') + '_' + slug(rec.prompt) + (media.length > 1 ? '_' + (k + 1) : '');
-        const r = await send({ type: 'DOWNLOAD', url, name, ext });
+        const r = await send({ type: 'DOWNLOAD', url: got.dataUrl || got.url, name, ext: got.ext, mediaId: m.mediaId });
         if (!r.ok) log('#' + rec.seq + ' 下載失敗：' + r.error, 'warn');
       } catch (e) {
         log('#' + rec.seq + ' 下載失敗：' + (e && e.message), 'warn');
@@ -984,6 +1049,12 @@
     if (msg.type === 'PING') { sendResponse({ ok: true, editor: !!editor() }); return false; }
     if (msg.type === 'KICK') { stopFlag = false; loop(); sendResponse({ ok: true }); return false; }
     if (msg.type === 'STOP') { stopFlag = true; inflight.clear(); sendResponse({ ok: true }); return false; }
+    if (msg.type === 'FETCH_MEDIA') {
+      fetchMedia(msg)
+        .then((r) => sendResponse({ ok: true, ...r }))
+        .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+      return true;
+    }
     if (msg.type === 'LIST_ASSETS') {
       if (domBusy) { sendResponse({ ok: false, error: '佇列正在操作 Flow 介面，請稍後再試（或先暫停）' }); return false; }
       withDomLock(() => listAssets(msg))

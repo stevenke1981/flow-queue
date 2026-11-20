@@ -99,3 +99,37 @@ CLI `flowq` (same transport): status | add <prompt...> [-f file] [--split blank|
 - `add` accepts `requestId` (string); the extension dedupes repeated requestIds for 10 minutes and returns the first result. MCP/CLI generate one per add call.
 - Files: max **10 MB** each; MCP sends files one `uploadFile` call at a time, then `add` with refs (not inline `files`). URL fetch: http(s) only, block private/loopback/link-local IPs after DNS resolution, no redirects to such hosts, 10 MB cap.
 - flow_wait returns within **50 s** per call (`{done:false, counts}` if still running) so MCP client tool timeouts are not exceeded; the agent calls it again.
+
+## 8. One bridge, several Chrome profiles (v1.2)
+
+Problem: each profile's bridge-client connected and the daemon replaced the old socket (4000), so two profiles evicted each other forever.
+
+- bridge-client persists a per-profile `instanceId` (crypto.randomUUID) in `chrome.storage.local.bridgeInstanceId` and sends it in `hello` together with `takeover: boolean` (true only for a user-initiated takeover).
+- Daemon, after verifying the hello mac, when an authenticated connection already exists:
+  - same `instanceId` → replace the old socket (close it with 4000 'replaced') — this is a service-worker restart of the same profile;
+  - existing socket stale (no frame received for > 45 s) → replace it (4000);
+  - `takeover: true` → replace it, closing the old one with **4003** 'taken over';
+  - otherwise → reject the newcomer with **4002** 'busy' and keep the existing connection untouched.
+  - Before closing with 4002 the daemon sends the newcomer `{type:'busy', mac: hex(HMAC-SHA256(token, 'busy:' + extNonce))}`;
+    before closing the old socket with 4003 it sends it `{type:'taken', mac: hex(HMAC-SHA256(token, 'taken:' + extNonce))}`
+    (extNonce = the nonce that connection sent in its own hello). Only a daemon holding the token can make a profile stop retrying.
+- `takeover:true` is used for exactly one hello: the client clears the flag as soon as that hello is sent and on every
+  close / handshake-timeout / connect-failure path, so later automatic retries always send `takeover:false`.
+- bridge-client close handling (4002/4003 count only when the matching signed busy/taken frame verified; an unsigned or
+  forged 4002/4003 is treated like any other drop → 'offline' with normal backoff):
+  - 4000 → normal reconnect with backoff; if the socket was authenticated, first regenerate and persist a new
+    `instanceId` (another live socket uses ours, e.g. a cloned profile directory), so the retry is answered 4002 instead of
+    evicting the other socket again;
+  - 4002 → `bridge.code='busy'`, lastError '另一個 Chrome 設定檔正在使用橋接'; no fast backoff — retry only on the 'bridge' alarm (≥ 60 s between attempts), so it takes over automatically once the other profile disconnects;
+  - 4003 → `bridge.code='taken'`, lastError '已被另一個 Chrome 設定檔接管'; NO automatic reconnect until the user takes over again or changes bridge settings.
+    The 'taken' state survives service-worker restarts but is cleared on `chrome.runtime.onStartup` (browser restart): the
+    retry sends takeover:false, so it cannot evict the other profile — at worst it is answered busy.
+- `chrome.storage.local.bridge` gains `code`: '' | 'busy' | 'taken' | 'auth' | 'offline' | 'disabled' | 'no-token'.
+- `globalThis.FQBridge.reconnect({ takeover: true })` performs a takeover; background message `BRIDGE_TAKEOVER` calls it; the side panel shows 「改用這個設定檔」 when code is busy or taken.
+- `GET /api/health` also returns `{ instance: <short instanceId prefix or null> }`.
+
+## 9. Downloading blob: results (v1.2)
+
+Flow sometimes renders results with page-scoped `blob:` URLs, which the service worker cannot download and which die on reload.
+- content.js stores `results[].mediaId` and prefers a durable URL (img/video/source/a attributes containing `getMediaUrlRedirect` or `flow-content.google`) over `blob:`.
+- DOWNLOAD with a `blob:` url (or `fetchViaTab: true`) is routed by the background to the Flow tab: content message `FETCH_MEDIA {src, mediaId}` → `{ok, dataUrl, mime, ext}`; the content script first fetches the stored blob URL, and if that fails, finds the tile by mediaId in the current page and fetches its current source. Cap 40 MB. Background then downloads the data URL.

@@ -941,8 +941,14 @@ function renderBridge() {
   if (!s.bridgeEnabled) { kind = 'off'; text = '未啟用：AI 代理無法操作佇列'; }
   else if (!s.bridgeToken) { kind = 'warn'; text = '請貼上配對碼後才會連線'; }
   else if (b && b.connected) { kind = 'ok'; text = '已連線' + (b.port ? '（埠 ' + b.port + '）' : ''); }
+  else if (b && (b.code === 'busy' || b.code === 'taken')) {
+    kind = 'warn';
+    text = (b.lastError || '另一個 Chrome 設定檔正在使用橋接') + (b.code === 'busy' ? '；對方離線後會自動接手' : '');
+  }
   else { kind = 'err'; text = '未連線' + (b && b.lastError ? '：' + b.lastError : '，請確認已在終端機啟動橋接程式'); }
   const at = b && b.at && (kind === 'ok' || kind === 'err') ? '更新於 ' + fmtTime(b.at) : '';
+  const canTakeover = !!(s.bridgeEnabled && s.bridgeToken && b && !b.connected && (b.code === 'busy' || b.code === 'taken'));
+  setHidden($('bridgeTakeover'), !canTakeover);
   const sig = kind + '\u0001' + text + '\u0001' + at;
   if (sig === bridgeSig) return; // 只在真的有變化時才更新 live region
   bridgeSig = sig;
@@ -954,6 +960,17 @@ function renderBridge() {
   if (at) nodes.push(el('span', 'bridge-at', at));
   box.replaceChildren(...nodes);
   setHidden($('bridgeTabDot'), !(kind === 'err' || kind === 'warn'));
+}
+
+async function takeoverBridge() {
+  const btn = $('bridgeTakeover');
+  btn.disabled = true;
+  try {
+    const r = await send({ type: 'BRIDGE_TAKEOVER' });
+    if (r) toast('已改由這個 Chrome 設定檔連線橋接', true);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function validateTokenField() {
@@ -1063,6 +1080,7 @@ $('input').addEventListener('keydown', (e) => {
   if (e.isComposing) return;
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); addItems(e.shiftKey); }
 });
+$('bridgeTakeover').addEventListener('click', takeoverBridge);
 $('splitMode').addEventListener('change', () => { updateCount(); saveSetting({ splitMode: $('splitMode').value }); });
 $('add').addEventListener('click', () => addItems(false));
 $('addTop').addEventListener('click', () => addItems(true));

@@ -1,17 +1,17 @@
 // 背景腳本（佇列狀態機、素材、FQ 橋接 API）的模擬測試：node test/background.test.js
 
 const fs = require('fs'), vm = require('vm'), crypto = require('crypto');
-const store = {}; const listeners = {};
+const store = {}; const sentToTab = []; const downloads = []; const listeners = {};
 const ev = (name) => ({ addListener: (f) => (listeners[name] = listeners[name] || []).push(f) });
 const chrome = {
   runtime: { id: 'ext', onInstalled: ev('installed'), onStartup: ev('startup'), onMessage: ev('msg') },
   storage: { local: { get: async (keys) => { const o = {}; for (const k of [].concat(keys)) if (k in store) o[k] = JSON.parse(JSON.stringify(store[k])); return o; }, set: async (o) => Object.assign(store, JSON.parse(JSON.stringify(o))) } },
   sidePanel: { setPanelBehavior: async () => {} },
-  tabs: { get: async (id) => ({ id, url: 'https://flow.google.com/project/abc', title: 'Flow' }), sendMessage: async () => ({ ok: true }), query: async () => [{ id: 7, url: 'https://flow.google.com/project/abc', title: 'Flow' }], onRemoved: ev('removed'), onUpdated: ev('updated') },
+  tabs: { get: async (id) => ({ id, url: 'https://flow.google.com/project/abc', title: 'Flow' }), sendMessage: async (tabId, m) => { sentToTab.push({ tabId, m }); if (m && m.type === 'FETCH_MEDIA') return m.src === 'blob:dead' ? { ok: false, error: 'gone' } : m.src === 'blob:evil' ? { ok: true, url: 'file:///C:/x', ext: 'exe' } : { ok: true, dataUrl: 'data:video/mp4;base64,AAAA', ext: 'mp4' }; return { ok: true }; }, query: async () => [{ id: 7, url: 'https://flow.google.com/project/abc', title: 'Flow' }], onRemoved: ev('removed'), onUpdated: ev('updated') },
   scripting: { executeScript: async () => {} },
   debugger: { onDetach: ev('detach'), attach: async () => {}, detach: async () => {}, sendCommand: async () => {} },
   alarms: { create: () => {}, clear: async () => {}, onAlarm: ev('alarm') },
-  downloads: { download: async () => 1 },
+  downloads: { download: async (o) => { downloads.push(o); return 1; } },
 };
 chrome.storage.session = { _d: {}, get: async (k) => ({ [k]: chrome.storage.session._d[k] }), set: async (o) => Object.assign(chrome.storage.session._d, o) };
 chrome.storage.local.remove = async (keys) => { for (const k of [].concat(keys)) delete store[k]; };
@@ -97,6 +97,30 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   assert(a3.ids[0] === a1.ids[0], 'repeated requestId returns first result');
   const lst = await FQ.call('list', { status: 'pending' });
   assert(lst.total >= 1, 'FQ list by status');
+  // ---- v1.2: blob downloads + bridge takeover ----
+  store.queue.push({ id: 'blobitem', seq: 99, prompt: 'v', status: 'done', results: [{ src: 'blob:https://flow.google.com/abc', isVideo: true, mediaId: 'mid-1' }] });
+  await chrome.storage.local.set({ run: { state: 'idle', tabId: 7 } });
+  r = await new Promise((res) => listeners.msg[0]({ type: 'DOWNLOAD', url: 'blob:https://flow.google.com/abc', name: '099_v', ext: 'mp4' }, { id: 'ext' }, res));
+  const fm = sentToTab.find((x) => x.m.type === 'FETCH_MEDIA');
+  assert(r.ok && fm && fm.tabId === 7 && fm.m.mediaId === 'mid-1' && fm.m.isVideo === true, 'blob DOWNLOAD from side panel is fetched via the Flow tab with mediaId');
+  assert(downloads.at(-1).url.startsWith('data:video/mp4') && downloads.at(-1).filename.endsWith('099_v.mp4'), 'blob DOWNLOAD saves the data URL');
+  r = await new Promise((res) => listeners.msg[0]({ type: 'DOWNLOAD', url: 'blob:dead', name: 'x' }, { id: 'ext' }, res));
+  assert(!r.ok && /gone/.test(r.error), 'dead blob reports the content-script error');
+  r = await new Promise((res) => listeners.msg[0]({ type: 'DOWNLOAD', url: 'javascript:alert(1)', name: 'x' }, { id: 'ext' }, res));
+  assert(!r.ok, 'non https/data/blob download refused');
+  const nBefore = sentToTab.length;
+  r = await new Promise((res) => listeners.msg[0]({ type: 'DOWNLOAD', url: 'https://flow-content.google/x.jpg', name: 'y', ext: 'jpg' }, { id: 'ext' }, res));
+  assert(r.ok && sentToTab.length === nBefore && downloads.at(-1).url === 'https://flow-content.google/x.jpg', 'https DOWNLOAD goes straight to chrome.downloads');
+  r = await new Promise((res) => listeners.msg[0]({ type: 'DOWNLOAD', url: 'blob:evil', name: 'x' }, { id: 'ext' }, res));
+  assert(!r.ok, 'tab-provided non https/data url rejected');
+  r = await new Promise((res) => listeners.msg[0]({ type: 'DOWNLOAD', url: 'https://flow-content.google/a', name: 'z', ext: 'exe' }, { id: 'ext' }, res));
+  assert(r.ok && downloads.at(-1).filename.endsWith('z.jpg'), 'unsafe extension replaced');
+  r = await new Promise((res) => listeners.msg[0]({ type: 'BRIDGE_TAKEOVER' }, { id: 'ext', tab: { id: 7, url: 'https://flow.google.com/project/abc' } }, res));
+  assert(!r.ok, 'BRIDGE_TAKEOVER refused from a tab');
+  let took = null;
+  ctx.FQBridge = { reconnect: async (o) => { took = o; } };
+  r = await new Promise((res) => listeners.msg[0]({ type: 'BRIDGE_TAKEOVER' }, { id: 'ext' }, res));
+  assert(r.ok && took && took.takeover === true, 'BRIDGE_TAKEOVER calls FQBridge.reconnect({takeover:true})');
   await listeners.startup[0]();
   assert(store.run.state === 'idle' && store.run.tabId === null, 'startup resets run');
 })();

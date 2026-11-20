@@ -60,14 +60,17 @@ function req(port, { method = 'GET', path: p = '/api/health', headers = {}, body
 }
 
 // ---------- fake extension: bridge-client.js inside a vm with a fake chrome API ----------
-function makeExtension({ port, token, wsOrigin, fq }) {
-  const store = { settings: { bridgeEnabled: true, bridgePort: port, bridgeToken: token } };
+function makeExtension({ port, token, wsOrigin, fq, instanceId, extra }) {
+  const store = { settings: { bridgeEnabled: true, bridgePort: port, bridgeToken: token }, ...(extra || {}) };
+  if (instanceId) store.bridgeInstanceId = instanceId;
+  const sockets = { opened: 0, closeCodes: [] };
   const changeListeners = [];
   const alarmListeners = [];
+  const startupListeners = [];
   const alarms = new Map();
   const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
   const chrome = {
-    runtime: { id: ORIGIN.split('//')[1], lastError: undefined, getManifest: () => ({ version: '1.1.0' }) },
+    runtime: { id: ORIGIN.split('//')[1], lastError: undefined, getManifest: () => ({ version: '1.1.0' }), onStartup: { addListener: (f) => startupListeners.push(f) } },
     storage: {
       local: {
         get: async (keys) => {
@@ -91,20 +94,31 @@ function makeExtension({ port, token, wsOrigin, fq }) {
     },
   };
   class ExtWebSocket extends WebSocket {
-    constructor(url) { super(url, { headers: { Origin: wsOrigin || ORIGIN } }); }
+    constructor(url) {
+      super(url, { headers: { Origin: wsOrigin || ORIGIN } });
+      sockets.opened++;
+      this.addEventListener('close', (ev) => sockets.closeCodes.push(ev.code));
+    }
   }
   const sandbox = {
     chrome, WebSocket: ExtWebSocket, crypto: globalThis.crypto, TextEncoder, TextDecoder,
     setTimeout, clearTimeout, setInterval, clearInterval, console, FQ: { call: fq },
   };
   sandbox.globalThis = sandbox;
+  sandbox.__skew = 0;
   vm.createContext(sandbox);
+  // injectable clock: lets the test jump past the 60 s busy-retry spacing without waiting
+  vm.runInContext('(() => { const real = Date.now.bind(Date); Date.now = () => real() + (globalThis.__skew || 0); })()', sandbox);
   vm.runInContext(fs.readFileSync(BRIDGE_CLIENT, 'utf8'), sandbox, { filename: 'bridge-client.js' });
   return {
-    store, alarms, sandbox,
+    store, alarms, sandbox, sockets,
+    instance: () => store.bridgeInstanceId,
+    skew: (ms) => { sandbox.__skew += ms; },
+    takeover: () => sandbox.FQBridge.reconnect({ takeover: true }),
     bridge: () => store.bridge || {},
     setSettings: (patch) => chrome.storage.local.set({ settings: { ...store.settings, ...patch } }),
     fireAlarm: (name) => alarmListeners.forEach((f) => f({ name })),
+    fireStartup: () => startupListeners.forEach((f) => f()),
   };
 }
 
@@ -117,6 +131,10 @@ function startFakeDaemon(port, onFrame) {
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
     const c = {
       socket, closed: null,
+      closeWith(code) {
+        socket.write(Buffer.from([0x88, 2, code >> 8, code & 255]));
+        socket.end();
+      },
       send(obj) {
         const p = Buffer.from(JSON.stringify(obj));
         const h = p.length < 126 ? Buffer.from([0x81, p.length]) : Buffer.from([0x81, 126, p.length >> 8, p.length & 255]);
@@ -145,6 +163,35 @@ function startFakeDaemon(port, onFrame) {
   });
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve({ server, conns })));
 }
+
+// ---------- raw extension client (hand-driven handshake) ----------
+function rawExt(port, token, { instanceId = '', takeover = false, fq = async () => ({ raw: true }) } = {}) {
+  const o = { welcomed: false };
+  let resolveReady, resolveClosed;
+  o.ready = new Promise((r) => (resolveReady = r));     // 'welcome' or the close code
+  o.closed = new Promise((r) => (resolveClosed = r));   // close code
+  const ws = new WebSocket('ws://127.0.0.1:' + port + '/ext', { headers: { Origin: ORIGIN } });
+  o.ws = ws;
+  let nonce = '';
+  ws.onerror = () => {};
+  ws.onmessage = async (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'challenge') {
+      nonce = crypto.randomBytes(32).toString('hex');
+      ws.send(JSON.stringify({ type: 'hello', version: 'raw', extensionId: 'raw', instanceId, takeover, nonce, mac: hmac(token, 'ext:' + m.nonce) }));
+    } else if (m.type === 'welcome') {
+      o.welcomed = m.mac === hmac(token, 'daemon:' + nonce);
+      resolveReady(o.welcomed ? 'welcome' : 'bad-welcome');
+    } else if (m.type === 'busy' || m.type === 'taken') {
+      o.signal = m.mac === hmac(token, m.type + ':' + nonce) ? m.type : 'bad-' + m.type;
+    } else if (m.type === 'req') {
+      ws.send(JSON.stringify({ type: 'res', id: m.id, ok: true, result: await fq(m.method, m.params) }));
+    }
+  };
+  ws.onclose = (ev) => { resolveReady(ev.code); resolveClosed(ev.code); };
+  return o;
+}
+const within = (p, ms) => Promise.race([p, sleep(ms).then(() => 'pending')]);
 
 // ---------- MCP stdio client ----------
 function startMcp(port) {
@@ -366,15 +413,121 @@ async function main() {
   await ext.setSettings({ bridgeEnabled: true });
   await until(() => ext.bridge().connected === true, 8000, 'reconnect after re-enabling');
   ok('bridgeEnabled:true → reconnects');
-  // a second extension instance with the same token replaces the first
+  // 7b. several Chrome profiles (DESIGN §8)
+  const instA = ext.instance();
+  assert.match(instA, /^[0-9a-f-]{36}$/);
+  r = await req(port);
+  assert.strictEqual(r.json.instance, instA.slice(0, 8));
+  ok('instanceId persisted in storage; /api/health instance = ' + r.json.instance);
+
   const ext2 = makeExtension({ port, token, fq: async () => ({ second: true }) });
-  await until(() => ext2.bridge().connected === true, 8000, 'second extension');
+  await until(() => ext2.bridge().code === 'busy', 8000, 'second profile to be told busy');
+  assert.notStrictEqual(ext2.instance(), instA);
+  assert.strictEqual(ext2.bridge().lastError, '另一個 Chrome 設定檔正在使用橋接');
+  assert.deepStrictEqual(ext2.sockets.closeCodes, [4002]);
+  assert.strictEqual(ext.bridge().connected, true);
+  assert.deepStrictEqual(ext.sockets.closeCodes.filter((c) => c !== 1000), []);
+  r = await req(port, { method: 'POST', path: '/api/call', headers: auth, body: { method: 'status' } });
+  assert.strictEqual(r.json.result.counts.total, 1);
+  assert.strictEqual((await req(port)).json.instance, instA.slice(0, 8));
+  ok('second profile (other instanceId) → 4002 busy; first stays connected and keeps serving /api/call');
+
+  await sleep(2500);
+  assert.strictEqual(ext2.sockets.opened, 1);
+  ext2.fireAlarm('bridge');
+  await sleep(500);
+  assert.strictEqual(ext2.sockets.opened, 1);
+  ok('busy profile does not retry on backoff, nor on an alarm < 60 s later');
+  ext2.skew(61000);
+  ext2.fireAlarm('bridge');
+  await until(() => ext2.sockets.opened === 2 && ext2.sockets.closeCodes.length === 2, 5000, 'busy retry on alarm');
+  assert.strictEqual(ext2.bridge().code, 'busy');
+  assert.strictEqual(ext.bridge().connected, true);
+  ok('busy profile retries on the alarm after ≥ 60 s (still busy, first untouched)');
+
+  const tk = await ext2.takeover();
+  assert.strictEqual(tk.connected, true, JSON.stringify(tk));
+  await until(() => ext.bridge().code === 'taken', 5000, 'first profile to be taken over');
+  assert.strictEqual(ext.bridge().lastError, '已被另一個 Chrome 設定檔接管');
+  assert.strictEqual(ext.sockets.closeCodes[ext.sockets.closeCodes.length - 1], 4003);
   r = await req(port, { method: 'POST', path: '/api/call', headers: auth, body: { method: 'anything' } });
   assert.deepStrictEqual(r.json.result, { second: true });
-  await until(() => ext.bridge().connected === false, 5000, 'old connection replaced');
-  ok('new extension connection replaces the old one');
+  assert.strictEqual((await req(port)).json.instance, ext2.instance().slice(0, 8));
+  const openedA = ext.sockets.opened;
+  await sleep(2500);
+  ext.skew(61000);
+  ext.fireAlarm('bridge');
+  await sleep(500);
+  assert.strictEqual(ext.sockets.opened, openedA);
+  assert.strictEqual(ext.bridge().code, 'taken');
+  ok('FQBridge.reconnect({takeover:true}) → old profile gets 4003 "taken" and does not auto-reconnect');
+
+  // the taken profile takes the bridge back; then the other one waits as busy and inherits it on disconnect
+  assert.strictEqual((await ext.takeover()).connected, true);
+  await until(() => ext2.bridge().code === 'taken', 5000, 'ext2 taken');
+  await ext2.setSettings({ bridgePort: port, bridgeEnabled: false });
+  await ext2.setSettings({ bridgeEnabled: true });               // settings change clears 'taken'
+  await until(() => ext2.bridge().code === 'busy', 5000, 'ext2 busy after settings change');
+  ok('changing bridge settings clears "taken"; profile then waits as busy');
   await ext.setSettings({ bridgeEnabled: false });
+  await until(async () => (await req(port)).json.extensionConnected === false, 5000, 'first profile to disconnect');
+  ext2.skew(61000);
+  ext2.fireAlarm('bridge');
+  await until(() => ext2.bridge().connected === true, 5000, 'busy profile to take over on its alarm');
+  ok('busy profile takes over automatically on its alarm once the other profile disconnects');
+
+  // same instanceId (service-worker restart of the same profile) replaces with 4000
+  const oldId2 = ext2.instance();
+  const raw = rawExt(port, token, { instanceId: oldId2 });
+  assert.strictEqual(await within(raw.ready, 5000), 'welcome');
+  await until(() => ext2.sockets.closeCodes.includes(4000), 5000, 'ext2 socket replaced with 4000');
+  ok('same instanceId → existing socket closed with 4000 (replaced)');
+  await until(() => ext2.bridge().code === 'busy', 6000, 'ext2 to come back as busy under a new instanceId');
+  assert.notStrictEqual(ext2.instance(), oldId2);
+  assert.strictEqual(await within(raw.closed, 2000), 'pending');
+  ok('4000 while authenticated → bridge-client takes a new instanceId, reconnects, gets busy (holder kept)');
+  raw.ws.close();
   await ext2.setSettings({ bridgeEnabled: false });
+  await until(async () => (await req(port)).json.extensionConnected === false, 5000, 'bridge free');
+
+  // cloned profiles sharing one instanceId must not evict each other forever
+  const cloneId = crypto.randomUUID();
+  const clone1 = makeExtension({ port, token, instanceId: cloneId, fq: async () => ({ clone: 1 }) });
+  await until(() => clone1.bridge().connected === true, 5000, 'clone1 connected');
+  const clone2 = makeExtension({ port, token, instanceId: cloneId, fq: async () => ({ clone: 2 }) });
+  await until(() => clone2.bridge().connected === true, 5000, 'clone2 connected');
+  await until(() => clone1.bridge().code === 'busy', 6000, 'clone1 to settle as busy');
+  await sleep(3000);
+  assert.strictEqual(clone2.bridge().connected, true);
+  assert.deepStrictEqual(clone2.sockets.closeCodes, []);
+  assert.deepStrictEqual(clone1.sockets.closeCodes, [4000, 4002]);
+  assert.notStrictEqual(clone1.instance(), cloneId);
+  r = await req(port, { method: 'POST', path: '/api/call', headers: auth, body: { method: 'x' } });
+  assert.deepStrictEqual(r.json.result, { clone: 2 });
+  ok('cloned profiles (same instanceId): one 4000, the evicted clone re-ids and stays busy — no flip-flop');
+  await clone1.setSettings({ bridgeEnabled: false });
+  await clone2.setSettings({ bridgeEnabled: false });
+
+  // stale existing socket is replaced (second daemon with a short stale threshold)
+  const port3 = await freePort();
+  const d3 = spawn(process.execPath, [path.join(ROOT, 'server.js')], { env: { ...ENV, FLOW_QUEUE_PORT: String(port3), FLOW_QUEUE_STALE_MS: '800' }, stdio: 'ignore' });
+  children.push(d3);
+  await until(async () => { try { return (await req(port3)).status === 200; } catch (e) { return false; } }, 8000, 'stale-test daemon');
+  const holder = rawExt(port3, token, { instanceId: 'profile-holder' });
+  assert.strictEqual(await within(holder.ready, 5000), 'welcome');
+  const fresh = rawExt(port3, token, { instanceId: 'profile-fresh' });
+  assert.strictEqual(await within(fresh.ready, 5000), 4002);
+  assert.strictEqual(fresh.signal, 'busy');
+  ok('(stale-test daemon) live holder → newcomer gets signed {type:"busy"} frame + 4002');
+  await sleep(1200);                                            // holder silent > FLOW_QUEUE_STALE_MS
+  const late = rawExt(port3, token, { instanceId: 'profile-late' });
+  assert.strictEqual(await within(late.ready, 5000), 'welcome');
+  assert.strictEqual(await within(holder.closed, 3000), 4000);
+  assert.strictEqual((await req(port3)).json.instance, 'profile-');
+  r = await req(port3, { method: 'POST', path: '/api/call', headers: auth, body: { method: 'x' } });
+  assert.deepStrictEqual(r.json.result, { raw: true });
+  ok('stale existing socket (silent > threshold) → replaced with 4000; newcomer serves /api/call');
+  late.ws.close();
 
   // 8. the extension must reject a daemon whose welcome mac is wrong
   const fakePort = await freePort();
@@ -400,12 +553,71 @@ async function main() {
   await ext3.setSettings({ bridgeEnabled: false });
   fake.server.close();
 
+  // 8b. a takeover attempt while the daemon is down must not leave takeover:true for later automatic retries
+  const tkPort = await freePort();
+  const ext6 = makeExtension({ port: tkPort, token, fq: async () => ({}) });
+  await until(() => ext6.bridge().code === 'offline', 5000, 'ext6 offline (no daemon)');
+  const st6 = await ext6.takeover();
+  assert.strictEqual(st6.connected, false);
+  const hellos = [];
+  const fake2 = await startFakeDaemon(tkPort, (conn, msg) => { if (msg.type === 'hello') hellos.push(msg); });
+  fake2.server.on('upgrade', () => setImmediate(() => { const c2 = fake2.conns[fake2.conns.length - 1]; c2.send({ type: 'challenge', nonce: crypto.randomBytes(32).toString('hex') }); }));
+  await until(() => hellos.length >= 1, 8000, 'automatic retry hello');
+  assert.strictEqual(hellos[0].takeover, false);
+  ok('takeover attempt while daemon down → later automatic retry sends takeover:false');
+  // explicit takeover sends takeover:true exactly once
+  hellos.length = 0;
+  ext6.takeover();
+  await until(() => hellos.length >= 1, 5000, 'takeover hello');
+  assert.strictEqual(hellos[0].takeover, true);
+  ok('FQBridge.reconnect({takeover:true}) sends takeover:true in its hello');
+  await ext6.setSettings({ bridgeEnabled: false });
+  fake2.server.close();
+
+  // 8c. unsigned 4002 / 4003 are not trusted: treated as offline with normal backoff
+  const usPort = await freePort();
+  let usN = 0;
+  const fake3 = await startFakeDaemon(usPort, (conn, msg) => {
+    if (msg.type !== 'hello') return;
+    usN++;
+    if (usN === 1) conn.closeWith(4002);                                   // unsigned busy
+    else if (usN === 2) {                                                  // authenticated, then unsigned 4003
+      conn.send({ type: 'welcome', mac: hmac(token, 'daemon:' + msg.nonce) });
+      setTimeout(() => conn.closeWith(4003), 200);
+    } else if (usN === 3) {                                                // forged busy frame (wrong key)
+      conn.send({ type: 'busy', mac: hmac(wrongToken, 'busy:' + msg.nonce) });
+      conn.closeWith(4002);
+    }
+  });
+  fake3.server.on('upgrade', () => setImmediate(() => { const c3 = fake3.conns[fake3.conns.length - 1]; c3.nonce = crypto.randomBytes(32).toString('hex'); c3.send({ type: 'challenge', nonce: c3.nonce }); }));
+  const ext7 = makeExtension({ port: usPort, token, fq: async () => ({}) });
+  await until(() => usN >= 4, 15000, 'retries after unsigned/forged closes');
+  assert.deepStrictEqual(ext7.sockets.closeCodes.slice(0, 3), [4002, 4003, 4002]);
+  assert.notStrictEqual(ext7.bridge().code, 'busy');
+  assert.notStrictEqual(ext7.bridge().code, 'taken');
+  ok('unsigned/forged 4002 and unsigned 4003 → treated as offline, keeps retrying with backoff');
+  await ext7.setSettings({ bridgeEnabled: false });
+  fake3.server.close();
+
   // 9. bridge-client without token does not connect
   const ext4 = makeExtension({ port, token: '', fq: async () => ({}) });
   await until(() => ext4.bridge().lastError, 3000, 'no-token status');
   assert.strictEqual(ext4.bridge().connected, false);
   ok('bridge-client with empty token stays offline: ' + ext4.bridge().lastError);
   await ext4.setSettings({ bridgeEnabled: false });
+
+  // 9b. a service-worker restart keeps the 'taken' state (no automatic reconnect)
+  const ext5 = makeExtension({ port, token, fq: async () => ({}), extra: { bridge: { connected: false, code: 'taken', lastError: '已被另一個 Chrome 設定檔接管', at: Date.now(), port } } });
+  await sleep(1500);
+  ext5.fireAlarm('bridge');
+  await sleep(300);
+  assert.strictEqual(ext5.sockets.opened, 0);
+  assert.strictEqual(ext5.bridge().code, 'taken');
+  ok('after a service-worker restart a "taken" profile stays offline');
+  ext5.fireStartup();                                    // browser restart
+  await until(() => ext5.bridge().connected === true, 5000, 'taken state cleared on runtime.onStartup');
+  ok('chrome.runtime.onStartup clears a stored "taken" state and reconnects');
+  await ext5.setSettings({ bridgeEnabled: false });
 
   // 10. ensureDaemon spawns a detached daemon when none answers
   process.env.HOME = HOME; process.env.USERPROFILE = HOME;

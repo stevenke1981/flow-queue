@@ -5,7 +5,11 @@ try { importScripts('bridge-client.js'); } catch (e) { console.warn('bridge-clie
 const FLOW_URL_RE = /^https:\/\/(?:flow\.google(?:\.com)?\/|labs\.google\/fx\/)/i;
 const projectOf = (url) => { const m = String(url || '').match(/\/project\/([A-Za-z0-9_-]+)/); return m ? m[1] : ''; };
 const ITEM_PATCH_KEYS = new Set(['status', 'submittedAt', 'finishedAt', 'results', 'error']);
-const withTimeout = (p, ms, what) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(what + ' 逾時')), ms))]);
+const withTimeout = (p, ms, what) => {
+  let timer;
+  const t = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(what + ' 逾時')), ms); });
+  return Promise.race([p, t]).finally(() => clearTimeout(timer));
+};
 
 const DEFAULT_SETTINGS = Object.freeze({
   maxConcurrent: 1,      // 同時在 Flow 生成中的提示詞數量
@@ -576,12 +580,52 @@ const handlers = {
     return {};
   },
 
-  DOWNLOAD: async (msg) => {
-    const d = withDefaults(await chrome.storage.local.get(['settings']));
+  // blob: 網址只在 Flow 頁面內有效：交給該分頁的內容腳本讀出內容後再下載
+  DOWNLOAD: async (msg, sender) => {
+    const d = withDefaults(await chrome.storage.local.get(['settings', 'queue']));
+    let url = String(msg.url || '');
+    let ext = msg.ext;
+    if (!/^(https:|data:|blob:)/i.test(url)) throw new Error('不支援的下載網址');
+    if (/^blob:/i.test(url) || msg.fetchViaTab) {
+      let mediaId = String(msg.mediaId || '');
+      let isVideo = String(ext || '') === 'mp4';
+      let project = '';
+      for (const it of d.queue) {
+        const hit = (it.results || []).find((r) => r.src === url);
+        if (hit) { mediaId = mediaId || hit.mediaId || ''; isVideo = !!hit.isVideo; project = hit.projectId || ''; break; }
+      }
+      const fromTab = sender && sender.tab && FLOW_URL_RE.test(sender.tab.url || '') ? sender.tab.id : null;
+      let tabId = fromTab;
+      if (tabId == null && msg.tabId != null) {
+        const t = await chrome.tabs.get(Number(msg.tabId)).catch(() => null);
+        if (!t || !FLOW_URL_RE.test(t.url || '')) throw new Error('指定的分頁不是 Google Flow');
+        tabId = t.id;
+      }
+      if (tabId == null) tabId = await pickFlowTab(project);
+      if (tabId == null) throw new Error('這個結果是 Flow 頁面內的暫存網址，請先開啟該 Flow 專案分頁再下載');
+      await ensureContentScript(tabId);
+      const r = await withTimeout(chrome.tabs.sendMessage(tabId, { type: 'FETCH_MEDIA', src: url, mediaId, isVideo }), 90000, '從 Flow 分頁取得檔案');
+      if (!r || !r.ok) throw new Error((r && r.error) || 'Flow 分頁沒有回應');
+      url = String(r.dataUrl || r.url || '');
+      ext = r.ext || ext;
+      // 分頁回傳的內容也要再檢查一次，只接受 https 或 data:
+      if (!/^(https:|data:(image|video)\/)/i.test(url)) throw new Error('無法取得檔案內容');
+    }
     const folder = safeFolder(d.settings.downloadFolder) || 'FlowQueue';
-    const filename = folder + '/' + safeName(msg.name, 120) + '.' + (String(msg.ext || 'jpg').replace(/[^a-z0-9]/gi, '').slice(0, 5) || 'jpg');
-    const downloadId = await chrome.downloads.download({ url: msg.url, filename, conflictAction: 'uniquify', saveAs: false });
+    const cleanExt = String(ext || '').toLowerCase().replace('jpeg', 'jpg');
+    const safeExt = ['png', 'jpg', 'webp', 'gif', 'mp4', 'webm', 'mov'].includes(cleanExt) ? cleanExt : 'jpg';
+    const filename = folder + '/' + safeName(msg.name, 120) + '.' + safeExt;
+    const downloadId = await chrome.downloads.download({ url, filename, conflictAction: 'uniquify', saveAs: false });
     return { downloadId, filename };
+  },
+
+  BRIDGE_TAKEOVER: async (msg, sender) => {
+    if (sender && sender.tab) throw new Error('只能從側邊面板接管橋接');
+    const b = globalThis.FQBridge;
+    if (!b || typeof b.reconnect !== 'function') throw new Error('橋接模組尚未載入');
+    const status = await b.reconnect({ takeover: true });
+    if (status && status.connected === false && status.lastError) throw new Error('接管失敗：' + status.lastError);
+    return { bridge: status || null };
   }
 };
 
@@ -622,8 +666,12 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 });
 
 // ---------- target tab ----------
-async function pickFlowTab() {
+async function pickFlowTab(preferProject = '') {
   const ok = (t) => t && FLOW_URL_RE.test(t.url || '') && /\/project\//.test(t.url || '');
+  if (preferProject) {
+    const same = (await chrome.tabs.query({})).find((t) => ok(t) && projectOf(t.url) === preferProject);
+    if (same) return same.id;
+  }
   const { run } = await chrome.storage.local.get('run');
   if (run && run.tabId != null) {
     try { const t = await chrome.tabs.get(run.tabId); if (ok(t)) return t.id; } catch (e) {}
