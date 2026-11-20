@@ -7,85 +7,256 @@
 <link rel="stylesheet" href="sidepanel.css">
 </head>
 <body>
-<header class="hdr">
-  <div class="hdr-row">
-    <h1>Flow Queue</h1>
-    <span id="chip" class="chip idle">閒置</span>
-    <span id="cooldown" class="cooldown" hidden></span>
+<header class="top">
+  <div class="top-row">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="4" width="4" height="12" rx="1"/><rect x="8" y="4" width="4" height="12" rx="1"/><rect x="14" y="4" width="4" height="12" rx="1"/></svg>
+      <span class="brand-name">Flow Queue</span>
+    </div>
+    <span id="runPill" class="pill run-idle" role="status" aria-live="polite"><span class="pill-dot" aria-hidden="true"></span><span id="runLabel">閒置</span></span>
   </div>
-  <div id="runMsg" class="muted small"></div>
-  <div id="tabTitle" class="muted small ellipsis" hidden></div>
+
+  <div class="top-row">
+    <div class="tally">
+      <b id="sDone" class="tally-n">0</b><span class="tally-of">/ <span id="sTotal">0</span> 完成</span>
+      <button id="tallyFailed" class="tally-btn tally-fail" type="button" hidden></button>
+      <button id="tallyUnknown" class="tally-btn tally-unknown" type="button" hidden></button>
+    </div>
+    <div class="transport">
+      <button id="stop" class="btn btn-stop" type="button" title="停止；生成中的項目將標為未確認">
+        <svg class="ico fill" viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg><span>停止</span>
+      </button>
+      <button id="pause" class="btn btn-pause" type="button" hidden>
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 3.5v9M10.5 3.5v9"/></svg><span>暫停</span>
+      </button>
+      <button id="start" class="btn btn-primary btn-go" type="button">
+        <svg class="ico fill" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.2v9.6a.6.6 0 0 0 .9.5l7.4-4.8a.6.6 0 0 0 0-1L5.9 2.7a.6.6 0 0 0-.9.5z"/></svg><span id="startLabel">開始</span>
+      </button>
+    </div>
+  </div>
+
+  <div id="strip" class="strip" role="progressbar" aria-label="佇列進度" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"></div>
+
+  <div class="top-meta">
+    <span id="cooldown" class="meta-cool" hidden></span>
+    <span id="runMsg" class="ellipsis"></span>
+    <span class="meta-line">
+      <span id="tabTitle" class="ellipsis" hidden></span>
+      <button id="dlState" class="meta-btn" type="button" title="前往下載設定"></button>
+    </span>
+  </div>
+  <div id="runBanner" class="run-banner" hidden></div>
+
+  <nav class="tabs" role="tablist" aria-label="面板分頁">
+    <button id="tab-queue" class="tab" role="tab" type="button" aria-selected="true" aria-controls="panel-queue">佇列<span id="tabQueueCount" class="tab-n">0</span></button>
+    <button id="tab-settings" class="tab" role="tab" type="button" aria-selected="false" aria-controls="panel-settings" tabindex="-1">設定<span id="bridgeTabDot" class="tab-dot" hidden><span class="sr-only">橋接需要處理</span></span></button>
+    <button id="tab-logs" class="tab" role="tab" type="button" aria-selected="false" aria-controls="panel-logs" tabindex="-1">記錄<span id="logDot" class="tab-dot tab-dot-warn" hidden><span class="sr-only">有新的警告</span></span></button>
+  </nav>
 </header>
-<div id="toast" class="toast" hidden></div>
 
-<section class="card">
-  <textarea id="input" rows="5" placeholder="貼上提示詞（Ctrl+Enter 加入佇列）"></textarea>
-  <div class="row">
-    <select id="splitMode" title="分割方式">
-      <option value="blank">以空行分隔</option>
-      <option value="line">每行一個</option>
-    </select>
-    <label class="btn file-btn">匯入 .txt<input type="file" id="file" accept=".txt,text/plain" hidden></label>
-    <span id="count" class="muted small grow right">將加入 0 筆</span>
-  </div>
-  <div class="row">
-    <button id="add" class="btn primary grow">加入佇列</button>
-    <button id="addTop" class="btn grow">插到最前</button>
-  </div>
-</section>
+<main>
+  <!-- ============ 佇列 ============ -->
+  <section id="panel-queue" class="panel" role="tabpanel" aria-labelledby="tab-queue">
+    <section id="composer" class="composer" aria-label="新增提示詞">
+      <button id="composerToggle" class="composer-toggle" type="button" aria-expanded="true" aria-controls="composerBody" hidden>
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg><span id="composerToggleLabel">新增提示詞</span>
+      </button>
+      <div id="composerBody" class="composer-body">
+      <label for="input" class="sr-only">提示詞</label>
+      <textarea id="input" rows="4" placeholder="貼上提示詞，一段一筆&#10;Ctrl+Enter 加入佇列，Ctrl+Shift+Enter 插到最前"></textarea>
+      <div class="composer-bar">
+        <select id="splitMode" aria-label="分割方式">
+          <option value="blank">以空行分隔</option>
+          <option value="line">每行一個</option>
+        </select>
+        <button id="importTxt" class="btn btn-quiet btn-s" type="button">匯入 .txt</button>
+        <input type="file" id="file" accept=".txt,text/plain" hidden>
+        <span id="count" class="count" aria-live="polite">將加入 0 筆</span>
+      </div>
 
-<section class="card">
-  <div class="row">
-    <button id="start" class="btn primary grow">開始</button>
-    <button id="pause" class="btn grow">暫停</button>
-    <button id="stop" class="btn danger grow">停止</button>
-  </div>
-  <div class="stats">
-    <div><b id="sTotal">0</b><span>全部</span></div>
-    <div><b id="sPending">0</b><span>待處理</span></div>
-    <div><b id="sRunning">0</b><span>執行中</span></div>
-    <div><b id="sDone">0</b><span>完成</span></div>
-    <div><b id="sFailed">0</b><span title="含未確認、已停止">失敗/未確認</span></div>
-  </div>
-  <div class="bar"><div id="barFill"></div></div>
-</section>
+      <details class="mat" id="mat">
+        <summary class="mat-sum">
+          <svg class="ico chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4"/></svg>
+          <span class="mat-sum-t">素材</span>
+          <span id="matCount" class="count-badge" data-zero="1">0</span>
+          <span class="mat-sum-hint">角色、Flow 素材、參考圖，每筆都會附上</span>
+        </summary>
+        <div class="mat-body">
+          <div id="charField" class="field">
+            <div class="field-head">
+              <label for="charInput" class="field-l">角色</label>
+              <button id="loadChars" class="link-btn" type="button">從 Flow 載入清單</button>
+            </div>
+            <div id="charTokens" class="tokens">
+              <input id="charInput" class="token-input" type="text" autocomplete="off" placeholder="輸入角色名稱，Enter 或逗號確認">
+            </div>
+          </div>
 
-<section class="card">
-  <div id="list" class="list"></div>
-  <div id="empty" class="muted center">佇列是空的</div>
-  <div class="row wrap bulk">
-    <button id="clrDone" class="btn small">清除已完成</button>
-    <button id="retryFailed" class="btn small">重試失敗</button><!-- 只重試「失敗」；「未確認」可能已生成，請逐筆重試 -->
-    <button id="clrFailed" class="btn small">清除失敗</button>
-    <button id="copyFailed" class="btn small">複製失敗提示詞</button>
-    <button id="clrAll" class="btn small danger">清空全部</button>
-  </div>
-</section>
+          <div id="assetField" class="field">
+            <div class="field-head">
+              <label for="assetInput" class="field-l">Flow 素材庫</label>
+              <select id="matCat" class="select-s" aria-label="素材類別">
+                <option value="All">全部</option><option value="Images">圖片</option><option value="Uploads">上傳</option><option value="Videos">影片</option>
+              </select>
+              <button id="loadAssets" class="link-btn" type="button">從 Flow 載入清單</button>
+            </div>
+            <div id="assetTokens" class="tokens">
+              <input id="assetInput" class="token-input" type="text" autocomplete="off" placeholder="Flow 素材標題，Enter 或逗號確認">
+            </div>
+          </div>
 
-<details class="card">
-  <summary>設定</summary>
-  <div class="form">
-    <label>同時生成數 <input type="number" id="maxConcurrent" min="1" max="10" step="1"></label>
-    <label>送出間隔 秒
-      <span class="pair"><input type="number" id="delayMin" min="0" step="1"> ~ <input type="number" id="delayMax" min="0" step="1"></span></label>
-    <label>單筆逾時 分鐘 <input type="number" id="timeoutMin" min="1" step="1"></label>
-    <label>失敗重試次數 <input type="number" id="retries" min="0" max="10" step="1"></label>
-    <label>限流冷卻 秒 <input type="number" id="cooldownSec" min="10" step="10"></label>
-    <label class="chk"><input type="checkbox" id="trustedClick"> 使用真實點擊 (debugger)</label>
-    <div class="muted small hint">會顯示「正在偵錯此瀏覽器」提示，較穩定</div>
-    <label class="chk"><input type="checkbox" id="autoDownload"> 完成後自動下載</label>
-    <label>下載資料夾 <input type="text" id="downloadFolder" placeholder="FlowQueue"></label>
-    <div class="muted small hint">相對於 Chrome 下載目錄</div>
-  </div>
-</details>
+          <div id="picker" class="picker" hidden>
+            <div class="picker-head">
+              <span id="pickerTitle" class="picker-t"></span>
+              <label for="pickerFilter" class="sr-only">篩選清單</label>
+              <input id="pickerFilter" class="picker-filter" type="search" placeholder="篩選" autocomplete="off">
+              <button id="pickerClose" class="icon-btn" type="button" aria-label="關閉清單">
+                <svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>
+              </button>
+            </div>
+            <div id="pickerLoading" class="picker-loading" hidden><span class="spinner" aria-hidden="true"></span><span>正在從 Flow 讀取清單…</span></div>
+            <div id="assetChips" class="picker-chips" role="group" aria-labelledby="pickerTitle"></div>
+          </div>
 
-<details class="card">
-  <summary>記錄</summary>
-  <div class="row"><button id="clrLogs" class="btn small">清除記錄</button></div>
-  <div id="logs" class="logs"></div>
-</details>
+          <div class="field">
+            <div class="field-head"><span id="refLabel" class="field-l">參考圖</span></div>
+            <div id="drop" class="drop" role="button" tabindex="0" aria-labelledby="refLabel" aria-describedby="dropHint">
+              <svg class="ico drop-ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11v9h-11zM2.5 10.5l3-3 2.5 2.5 2-2 3.5 3.5"/><circle cx="10.5" cy="6" r="1"/></svg>
+              <span id="dropHint" class="drop-t">拖放圖片、點此選擇，或直接 Ctrl+V 貼上（每張 10 MB 內）</span>
+            </div>
+            <input type="file" id="matFiles" accept="image/*" multiple hidden>
+            <div id="matThumbs" class="thumbs"></div>
+          </div>
 
-<p class="tip muted small">提示：Flow 分頁保持在前景執行最穩定；模型、比例、數量請先在 Flow 介面設定好，佇列會沿用目前設定。</p>
+          <label class="check"><input type="checkbox" id="matKeep"><span>加入後保留素材設定</span></label>
+        </div>
+      </details>
+
+      <div class="composer-actions">
+        <button id="add" class="btn btn-primary btn-grow" type="button">加入佇列</button>
+        <button id="addTop" class="btn" type="button" title="插在第一筆待處理之前">插到最前</button>
+      </div>
+      </div>
+    </section>
+
+    <section class="queue" aria-labelledby="queueHeading">
+      <h2 id="queueHeading" class="sr-only">佇列</h2>
+      <div id="filters" class="filters" role="group" aria-label="依狀態篩選">
+        <button class="fchip" type="button" data-f="all" aria-pressed="true">全部<span id="fcAll" class="fchip-n">0</span></button>
+        <button class="fchip" type="button" data-f="pending" aria-pressed="false"><span class="fdot f-pending" aria-hidden="true"></span>待處理<span id="fcPending" class="fchip-n">0</span></button>
+        <button class="fchip" type="button" data-f="running" aria-pressed="false"><span class="fdot f-running" aria-hidden="true"></span>執行中<span id="fcRunning" class="fchip-n">0</span></button>
+        <button class="fchip" type="button" data-f="done" aria-pressed="false"><span class="fdot f-done" aria-hidden="true"></span>完成<span id="fcDone" class="fchip-n">0</span></button>
+        <button class="fchip" type="button" data-f="failed" aria-pressed="false"><span class="fdot f-failed" aria-hidden="true"></span>失敗<span id="fcFailed" class="fchip-n">0</span></button>
+        <button class="fchip" type="button" data-f="unknown" aria-pressed="false" title="已送出但無法確認結果，可能已生成"><span class="fdot f-unknown" aria-hidden="true"></span>未確認<span id="fcUnknown" class="fchip-n">0</span></button>
+      </div>
+
+      <div id="bulk" class="bulk" role="group" aria-label="批次操作">
+        <button id="retryFailed" class="btn btn-s" type="button" title="只重試「失敗」；「未確認」可能已生成，請逐筆確認後重試">重試失敗<span id="nRetry" class="btn-n">0</span></button>
+        <button id="copyFailed" class="btn btn-s" type="button">複製失敗提示詞<span id="nCopy" class="btn-n">0</span></button>
+        <button id="dlDone" class="btn btn-s" type="button">下載已完成<span id="nDl" class="btn-n">0</span></button>
+        <button id="clrDone" class="btn btn-s" type="button">清除已完成<span id="nClrDone" class="btn-n">0</span></button>
+        <button id="clrFailed" class="btn btn-s" type="button">清除失敗與未確認<span id="nClrFailed" class="btn-n">0</span></button>
+        <button id="clrAll" class="btn btn-s btn-danger-text" type="button">清空全部</button>
+      </div>
+
+      <div id="list" class="list" role="list" tabindex="-1" aria-label="佇列項目"></div>
+      <p id="filterEmpty" class="filter-empty" hidden></p>
+
+      <div id="empty" class="empty" hidden>
+        <p class="empty-t">佇列還是空的，三步開始批次生成</p>
+        <ol class="steps">
+          <li>
+            <span class="step-n" aria-hidden="true">1</span>
+            <div class="step-b"><b>開啟 Flow 專案</b><span>先在 Flow 選好模型、比例與數量，佇列會沿用。</span>
+              <button id="openFlow" class="link-btn" type="button">開啟 Flow</button></div>
+          </li>
+          <li>
+            <span class="step-n" aria-hidden="true">2</span>
+            <div class="step-b"><b>貼上提示詞</b><span>每段一筆，需要角色或參考圖就展開「素材」。</span>
+              <button id="focusInput" class="link-btn" type="button">前往輸入框</button></div>
+          </li>
+          <li>
+            <span class="step-n" aria-hidden="true">3</span>
+            <div class="step-b"><b>按「開始」</b><span>Flow 分頁保持在前景最穩定，可隨時暫停。</span></div>
+          </li>
+        </ol>
+      </div>
+
+    </section>
+  </section>
+
+  <!-- ============ 設定 ============ -->
+  <section id="panel-settings" class="panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
+    <fieldset class="group">
+      <legend>生成節奏</legend>
+      <div class="set"><label for="maxConcurrent">同時生成數</label><span class="unit-in"><input type="number" id="maxConcurrent" min="1" max="10" step="1"><span class="unit">筆</span></span></div>
+      <div class="set"><label for="delayMin">送出間隔</label>
+        <span class="unit-in"><input type="number" id="delayMin" min="0" step="1" aria-label="送出間隔最短秒數"><span class="unit">~</span><input type="number" id="delayMax" min="0" step="1" aria-label="送出間隔最長秒數"><span class="unit">秒</span></span></div>
+      <div class="set"><label for="timeoutMin">單筆逾時</label><span class="unit-in"><input type="number" id="timeoutMin" min="1" step="1"><span class="unit">分鐘</span></span></div>
+      <div class="set"><label for="retries">失敗自動重試</label><span class="unit-in"><input type="number" id="retries" min="0" max="10" step="1"><span class="unit">次</span></span></div>
+      <div class="set"><label for="cooldownSec">限流冷卻</label><span class="unit-in"><input type="number" id="cooldownSec" min="10" step="10"><span class="unit">秒</span></span></div>
+      <div class="set set-switch">
+        <label for="trustedClick">使用真實點擊<span class="hint">透過 debugger 送出點擊，較穩定；Chrome 會顯示「正在偵錯此瀏覽器」。</span></label>
+        <input type="checkbox" role="switch" id="trustedClick" class="switch">
+      </div>
+      <p class="group-note">Flow 分頁保持在前景執行最穩定；模型、比例、數量請先在 Flow 介面設定好。</p>
+    </fieldset>
+
+    <fieldset class="group">
+      <legend>素材</legend>
+      <div class="set set-switch">
+        <label for="clearIngredients">先清空 Flow 現有素材<span class="hint">只對有附素材的項目生效，避免沿用上一筆的角色或圖片。</span></label>
+        <input type="checkbox" role="switch" id="clearIngredients" class="switch">
+      </div>
+    </fieldset>
+
+    <fieldset class="group">
+      <legend>下載</legend>
+      <div class="set set-switch">
+        <label for="autoDownload">完成後自動下載</label>
+        <input type="checkbox" role="switch" id="autoDownload" class="switch">
+      </div>
+      <div class="set set-stack"><label for="downloadFolder">下載資料夾<span class="hint">相對於 Chrome 的下載目錄</span></label>
+        <input type="text" id="downloadFolder" placeholder="FlowQueue" spellcheck="false"></div>
+    </fieldset>
+
+    <fieldset class="group">
+      <legend>AI 代理橋接</legend>
+      <div id="bridgeStatus" class="bridge-status" data-kind="off" role="status" aria-live="polite">
+        <span class="bdot" aria-hidden="true"></span><span id="bridgeText">未啟用</span>
+      </div>
+      <div class="set set-switch">
+        <label for="bridgeEnabled">允許 AI 代理控制<span class="hint">讓本機的 Claude、Codex 等代理透過橋接程式操作佇列。</span></label>
+        <input type="checkbox" role="switch" id="bridgeEnabled" class="switch">
+      </div>
+      <div class="set set-stack"><label for="bridgeToken">配對碼<span class="hint">在終端機執行 flowq pair 取得配對碼</span></label>
+        <span class="secret">
+          <input type="password" id="bridgeToken" autocomplete="off" spellcheck="false" placeholder="貼上 64 字元配對碼" aria-describedby="tokenErr">
+          <button id="tokenToggle" class="icon-btn" type="button" aria-label="顯示配對碼" aria-pressed="false" aria-controls="bridgeToken">
+            <svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/></svg>
+          </button>
+        </span>
+        <p id="tokenErr" class="field-err" hidden></p></div>
+      <div class="set"><label for="bridgePort">橋接埠</label><span class="unit-in"><input type="number" id="bridgePort" min="1024" max="65535" step="1" class="w-port"></span></div>
+      <p class="group-note">安裝與設定方式見 flow-queue-bridge/README.md。</p>
+    </fieldset>
+  </section>
+
+  <!-- ============ 記錄 ============ -->
+  <section id="panel-logs" class="panel" role="tabpanel" aria-labelledby="tab-logs" hidden>
+    <div class="logs-bar">
+      <span class="logs-t">最新的在最上面</span>
+      <button id="clrLogs" class="btn btn-s" type="button">清除記錄</button>
+    </div>
+    <div id="logs" class="logs" role="log" aria-live="off" aria-label="執行記錄"></div>
+    <p id="logsEmpty" class="filter-empty" hidden>還沒有記錄</p>
+  </section>
+</main>
+
+<div class="toasts">
+  <div id="alertToast" class="toast toast-err" role="alert"></div>
+  <div id="toast" class="toast toast-ok" role="status" aria-live="polite"></div>
+</div>
 <script src="sidepanel.js"></script>
 </body>
 </html>
